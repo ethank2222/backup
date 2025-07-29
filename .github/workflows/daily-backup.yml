@@ -38,6 +38,8 @@ jobs:
                   echo "Starting backup of TrinityAI..."
                   mkdir -p backups/TrinityAI/${{ env.BACKUP_DATE }}
                   git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/TrinityAI.git backups/TrinityAI/${{ env.BACKUP_DATE }}/TrinityAI.git
+                  # Remove credentials from config to prevent secrets in backup
+                  sed -i 's|https://.*@github.com|https://github.com|g' backups/TrinityAI/${{ env.BACKUP_DATE }}/TrinityAI.git/config
                   echo "✅ TrinityAI mirrored successfully - $(date)" >> backup-log.txt
 
             - name: Backup TriniTeam mirror (all branches)
@@ -45,6 +47,8 @@ jobs:
                   echo "Starting backup of TriniTeam..."
                   mkdir -p backups/TriniTeam/${{ env.BACKUP_DATE }}
                   git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/TriniTeam.git backups/TriniTeam/${{ env.BACKUP_DATE }}/TriniTeam.git
+                  # Remove credentials from config to prevent secrets in backup
+                  sed -i 's|https://.*@github.com|https://github.com|g' backups/TriniTeam/${{ env.BACKUP_DATE }}/TriniTeam.git/config
                   echo "✅ TriniTeam mirrored successfully - $(date)" >> backup-log.txt
 
             - name: Backup PageAI mirror (all branches)
@@ -52,6 +56,8 @@ jobs:
                   echo "Starting backup of PageAI..."
                   mkdir -p backups/PageAI/${{ env.BACKUP_DATE }}
                   git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/PageAI.git backups/PageAI/${{ env.BACKUP_DATE }}/PageAI.git
+                  # Remove credentials from config to prevent secrets in backup
+                  sed -i 's|https://.*@github.com|https://github.com|g' backups/PageAI/${{ env.BACKUP_DATE }}/PageAI.git/config
                   echo "✅ PageAI mirrored successfully - $(date)" >> backup-log.txt
 
             - name: Create backup summary
