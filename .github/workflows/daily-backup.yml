@@ -130,9 +130,6 @@ jobs:
                   # Count total repositories backed up
                   REPO_COUNT=$(grep -c "mirrored successfully" backup-log.txt || echo "0")
 
-                  # Get backup sizes
-                  BACKUP_SIZES=$(grep -A 10 "Backup sizes:" backup-log.txt | tail -n +2 || echo "Size info not available")
-
                   # Determine if new backups were created
                   if [ "${{ env.NO_CHANGES }}" = "true" ]; then
                     STATUS_MESSAGE="No new backups needed (repositories unchanged)"
@@ -142,18 +139,15 @@ jobs:
 
                   curl -H 'Content-Type: application/x-www-form-urlencoded' \
                     -d "title=✅ GitHub Backup Successful" \
-                    -d "text=Daily backup completed successfully on ${{ env.BACKUP_DATE }}.\n\n**Status:** $STATUS_MESSAGE\n\n**Backup Sizes:**\n\`\`\`\n$BACKUP_SIZES\n\`\`\`\n\n[View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+                    -d "text=Backup successful on ${{ env.BACKUP_DATE }} - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
                     "${{ secrets.WEBHOOK_URL }}"
 
             - name: Send failure notification
               if: failure()
               run: |
-                  # Try to get the last few lines of logs for context
-                  RECENT_LOGS=$(tail -n 10 backup-log.txt 2>/dev/null || echo "No backup logs available")
-
                   curl -H 'Content-Type: application/x-www-form-urlencoded' \
                     -d "title=❌ GitHub Backup Failed" \
-                    -d "text=⚠️ **ALERT: Daily backup failed on ${{ env.BACKUP_DATE }}**\n\nImmediate action required to ensure data protection.\n\n**Recent logs:**\n\`\`\`\n$RECENT_LOGS\n\`\`\`\n\n🔗 [Check workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n**Next Steps:**\n1. Review error logs\n2. Verify token permissions\n3. Check repository access\n4. Run manual backup if needed" \
+                    -d "text=Backup failed on ${{ env.BACKUP_DATE }} - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
                     "${{ secrets.WEBHOOK_URL }}"
 
             - name: Send notification on cancellation
@@ -161,5 +155,5 @@ jobs:
               run: |
                   curl -H 'Content-Type: application/x-www-form-urlencoded' \
                     -d "title=⚠️ GitHub Backup Cancelled" \
-                    -d "text=Daily backup was cancelled on ${{ env.BACKUP_DATE }}.\n\n[View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\nConsider running a manual backup if needed." \
+                    -d "text=Backup cancelled on ${{ env.BACKUP_DATE }} - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
                     "${{ secrets.WEBHOOK_URL }}"
