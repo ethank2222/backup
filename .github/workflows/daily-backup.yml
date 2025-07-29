@@ -17,6 +17,7 @@ jobs:
             - name: Setup Git user
               run: |
                   git config --global user.name "Backup Bot"
+                  git config --global user.email "ethank2222@gmail.com"
 
             - name: Set backup date
               id: set_date
