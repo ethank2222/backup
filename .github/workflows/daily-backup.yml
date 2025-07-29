@@ -1,0 +1,108 @@
+name: Daily Repository Backup
+
+on:
+    schedule:
+        - cron: "0 2 * * *" # Daily at 2 AM UTC
+    workflow_dispatch:
+
+jobs:
+    backup:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout backup repository
+              uses: actions/checkout@v4
+              with:
+                  token: ${{ secrets.BACKUP_TOKEN }}
+                  fetch-depth: 0
+
+            - name: Setup Git
+              run: |
+                  git config --global user.name "Backup Bot"
+                  git config --global user.email "backup@yourorg.com"
+
+            - name: Create backup date and folders
+              run: |
+                  BACKUP_DATE=$(date +%Y-%m-%d)
+                  echo "BACKUP_DATE=$BACKUP_DATE" >> $GITHUB_ENV
+                  mkdir -p backups/REPO_1/$BACKUP_DATE
+                  mkdir -p backups/REPO_2/$BACKUP_DATE
+                  mkdir -p backups/REPO_3/$BACKUP_DATE
+
+            - name: Mirror backup of REPO_1 (all branches)
+              run: |
+                  cd backups/TrinityAI/${{ env.BACKUP_DATE }}
+                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/TrinityAI.git .
+                  echo "✅ REPO_1 mirrored successfully" >> ../../../backup-log.txt
+
+            - name: Mirror backup of REPO_2 (all branches)
+              run: |
+                  cd backups/PageAI/${{ env.BACKUP_DATE }}
+                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/PageAI.git .
+                  echo "✅ REPO_2 mirrored successfully" >> ../../../backup-log.txt
+
+            - name: Mirror backup of REPO_3 (all branches)
+              run: |
+                  cd backups/TriniTeam/${{ env.BACKUP_DATE }}
+                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/TriniTeam.git .
+                  echo "✅ REPO_3 mirrored successfully" >> ../../../backup-log.txt
+
+            - name: Create backup summary
+              run: |
+                  SUMMARY_DIR="backups/summary/${{ env.BACKUP_DATE }}"
+                  mkdir -p "$SUMMARY_DIR"
+                  echo "# Backup Summary - ${{ env.BACKUP_DATE }}" > "$SUMMARY_DIR/README.md"
+                  echo "" >> "$SUMMARY_DIR/README.md"
+                  echo "Backup completed at: $(date)" >> "$SUMMARY_DIR/README.md"
+                  echo "Repositories backed up:" >> "$SUMMARY_DIR/README.md"
+                  echo "- REPO_1" >> "$SUMMARY_DIR/README.md"
+                  echo "- REPO_2" >> "$SUMMARY_DIR/README.md"
+                  echo "- REPO_3" >> "$SUMMARY_DIR/README.md"
+                  echo "" >> "$SUMMARY_DIR/README.md"
+                  cat backup-log.txt >> "$SUMMARY_DIR/README.md"
+
+            - name: Cleanup old backups (keep last 5 days per repo)
+              run: |
+                  cd backups
+                  for REPO in REPO_1 REPO_2 REPO_3; do
+                    if [ -d "$REPO" ]; then
+                      cd "$REPO"
+                      BACKUPS=($(ls -1d 20* | sort))
+                      COUNT=${#BACKUPS[@]}
+                      if [ $COUNT -gt 5 ]; then
+                        TO_DELETE=(${BACKUPS[@]:0:$((COUNT - 5))})
+                        for OLD in "${TO_DELETE[@]}"; do
+                          echo "Deleting old backup: $REPO/$OLD"
+                          rm -rf "$OLD"
+                        done
+                      fi
+                      cd ..
+                    fi
+                  done
+
+            - name: Commit and push backups
+              run: |
+                  git add .
+                  if git diff --staged --quiet; then
+                    echo "No changes to commit"
+                  else
+                    git commit -m "Daily mirror backup - ${{ env.BACKUP_DATE }}"
+                    git push origin main
+                  fi
+
+            - name: Send Microsoft Teams message (success or failure)
+              if: always()
+              run: |
+                  if [ ${{ job.status }} == 'success' ]; then
+                    TITLE="✅ GitHub Backup Succeeded"
+                    TEXT="Backup succeeded on ${{ env.BACKUP_DATE }}. See the [workflow logs]('${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}')."
+                  else
+                    TITLE="❌ GitHub Backup Failed"
+                    TEXT="Backup failed on ${{ env.BACKUP_DATE }}. Check the [workflow logs]('${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}')."
+                  fi
+
+                  curl -H 'Content-Type: application/json' \
+                      -d "{
+                            \"title\": \"$TITLE\",
+                            \"text\": \"$TEXT\"
+                          }" \
+                      "${{ secrets.TEAMS_WEBHOOK_URL }}"
