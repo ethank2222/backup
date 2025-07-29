@@ -89,18 +89,19 @@ jobs:
                     fi
                   done
 
-            - name: Cleanup old backups (keep last 5 days per repo)
+            - name: Cleanup old backups (keep last 5 backups per repo)
               run: |
                   cd backups
                   CLEANED_COUNT=0
                   for REPO in TrinityAI TriniTeam PageAI; do
                     if [ -d "$REPO" ]; then
                       cd "$REPO"
-                      # Get sorted list of backup directories
-                      BACKUPS=($(ls -1d 20* 2>/dev/null | sort || true))
+                      # Get sorted list of backup directories (newest first)
+                      BACKUPS=($(ls -1d 20* 2>/dev/null | sort -r || true))
                       COUNT=${#BACKUPS[@]}
                       if [ $COUNT -gt 5 ]; then
-                        TO_DELETE=(${BACKUPS[@]:0:$((COUNT - 5))})
+                        # Keep the 5 newest backups, delete the rest
+                        TO_DELETE=(${BACKUPS[@]:5})
                         for OLD in "${TO_DELETE[@]}"; do
                           echo "Deleting old backup: $REPO/$OLD"
                           rm -rf "$OLD"
