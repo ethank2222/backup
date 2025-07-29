@@ -36,19 +36,22 @@ jobs:
             - name: Backup TrinityAI mirror (all branches)
               run: |
                   echo "Starting backup of TrinityAI..."
-                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/YOUR_ORG/TrinityAI.git backups/TrinityAI/${{ env.BACKUP_DATE }}/TrinityAI.git
+                  mkdir -p backups/TrinityAI/${{ env.BACKUP_DATE }}
+                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/TrinityAI.git backups/TrinityAI/${{ env.BACKUP_DATE }}/TrinityAI.git
                   echo "✅ TrinityAI mirrored successfully - $(date)" >> backup-log.txt
 
             - name: Backup TriniTeam mirror (all branches)
               run: |
                   echo "Starting backup of TriniTeam..."
-                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/YOUR_ORG/TriniTeam.git backups/TriniTeam/${{ env.BACKUP_DATE }}/TriniTeam.git
+                  mkdir -p backups/TriniTeam/${{ env.BACKUP_DATE }}
+                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/TriniTeam.git backups/TriniTeam/${{ env.BACKUP_DATE }}/TriniTeam.git
                   echo "✅ TriniTeam mirrored successfully - $(date)" >> backup-log.txt
 
             - name: Backup PageAI mirror (all branches)
               run: |
                   echo "Starting backup of PageAI..."
-                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/YOUR_ORG/PageAI.git backups/PageAI/${{ env.BACKUP_DATE }}/PageAI.git
+                  mkdir -p backups/PageAI/${{ env.BACKUP_DATE }}
+                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/PageAI.git backups/PageAI/${{ env.BACKUP_DATE }}/PageAI.git
                   echo "✅ PageAI mirrored successfully - $(date)" >> backup-log.txt
 
             - name: Create backup summary
@@ -112,7 +115,7 @@ jobs:
                     echo "BACKUP_COMMITTED=true" >> $GITHUB_ENV
                   fi
 
-            - name: Send success notification to Microsoft Teams
+            - name: Send success notification
               if: success()
               run: |
                   # Count total repositories backed up
@@ -133,9 +136,9 @@ jobs:
                       "title": "✅ GitHub Backup Successful",
                       "text": "Daily backup completed successfully on ${{ env.BACKUP_DATE }}.\n\n**Status:** '"$STATUS_MESSAGE"'\n\n**Backup Sizes:**\n```\n'"$BACKUP_SIZES"'\n```\n\n[View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
                     }' \
-                    "${{ secrets.TEAMS_WEBHOOK_URL }}"
+                    "${{ secrets.WEBHOOK_URL }}"
 
-            - name: Send failure notification to Microsoft Teams
+            - name: Send failure notification
               if: failure()
               run: |
                   # Try to get the last few lines of logs for context
@@ -146,7 +149,7 @@ jobs:
                       "title": "❌ GitHub Backup Failed",
                       "text": "⚠️ **ALERT: Daily backup failed on ${{ env.BACKUP_DATE }}**\n\nImmediate action required to ensure data protection.\n\n**Recent logs:**\n```\n'"$RECENT_LOGS"'\n```\n\n🔗 [Check workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n**Next Steps:**\n1. Review error logs\n2. Verify token permissions\n3. Check repository access\n4. Run manual backup if needed"
                     }' \
-                    "${{ secrets.TEAMS_WEBHOOK_URL }}"
+                    "${{ secrets.WEBHOOK_URL }}"
 
             - name: Send notification on cancellation
               if: cancelled()
@@ -156,4 +159,4 @@ jobs:
                       "title": "⚠️ GitHub Backup Cancelled",
                       "text": "Daily backup was cancelled on ${{ env.BACKUP_DATE }}.\n\n[View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\nConsider running a manual backup if needed."
                     }' \
-                    "${{ secrets.TEAMS_WEBHOOK_URL }}"
+                    "${{ secrets.WEBHOOK_URL }}"
