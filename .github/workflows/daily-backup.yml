@@ -28,15 +28,20 @@ jobs:
 
             - name: Create backup directories
               run: |
+                  # Remove existing backup for today if it exists
+                  rm -rf backups/TrinityAI/${{ env.BACKUP_DATE }}
+                  rm -rf backups/TriniTeam/${{ env.BACKUP_DATE }}
+                  rm -rf backups/PageAI/${{ env.BACKUP_DATE }}
+
+                  # Create fresh backup directories
                   mkdir -p backups/TrinityAI/${{ env.BACKUP_DATE }}
                   mkdir -p backups/TriniTeam/${{ env.BACKUP_DATE }}
                   mkdir -p backups/PageAI/${{ env.BACKUP_DATE }}
-                  echo "Backup directories created" > backup-log.txt
+                  echo "Backup directories created (replaced existing if any)" > backup-log.txt
 
             - name: Backup TrinityAI mirror (all branches)
               run: |
                   echo "Starting backup of TrinityAI..."
-                  mkdir -p backups/TrinityAI/${{ env.BACKUP_DATE }}
                   git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/TrinityAI.git backups/TrinityAI/${{ env.BACKUP_DATE }}/TrinityAI.git
                   # Remove credentials from config to prevent secrets in backup
                   sed -i 's|https://.*@github.com|https://github.com|g' backups/TrinityAI/${{ env.BACKUP_DATE }}/TrinityAI.git/config
@@ -45,7 +50,6 @@ jobs:
             - name: Backup TriniTeam mirror (all branches)
               run: |
                   echo "Starting backup of TriniTeam..."
-                  mkdir -p backups/TriniTeam/${{ env.BACKUP_DATE }}
                   git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/TriniTeam.git backups/TriniTeam/${{ env.BACKUP_DATE }}/TriniTeam.git
                   # Remove credentials from config to prevent secrets in backup
                   sed -i 's|https://.*@github.com|https://github.com|g' backups/TriniTeam/${{ env.BACKUP_DATE }}/TriniTeam.git/config
@@ -54,7 +58,6 @@ jobs:
             - name: Backup PageAI mirror (all branches)
               run: |
                   echo "Starting backup of PageAI..."
-                  mkdir -p backups/PageAI/${{ env.BACKUP_DATE }}
                   git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/PageAI.git backups/PageAI/${{ env.BACKUP_DATE }}/PageAI.git
                   # Remove credentials from config to prevent secrets in backup
                   sed -i 's|https://.*@github.com|https://github.com|g' backups/PageAI/${{ env.BACKUP_DATE }}/PageAI.git/config
