@@ -1,121 +1,81 @@
 name: Daily Repository Backup
 on:
-  schedule:
-    - cron: "0 2 * * *" # Run daily at 2 AM UTC
-  workflow_dispatch: # Allow manual triggering
+    schedule:
+        - cron: "0 2 * * *" # Run daily at 2 AM UTC
+    workflow_dispatch: # Allow manual triggering
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    backup:
+        name: Backup Repositories
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout backup repository
+              uses: actions/checkout@v4
+              with:
+                  token: ${{ secrets.BACKUP_TOKEN }}
+                  fetch-depth: 0
 
-      - name: Setup Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: "1.21"
+            - name: Setup Git user
+              run: |
+                  git config --global user.name "Backup Bot"
+                  git config --global user.email "ethank2222@gmail.com"
 
-      - name: Install dependencies
-        run: go mod download
+            - name: Setup Go
+              uses: actions/setup-go@v4
+              with:
+                  go-version: "1.21"
 
-      - name: Run tests
-        run: go test -v ./...
+            - name: Install dependencies
+              run: go mod download
 
-      - name: Run tests with coverage
-        run: |
-          mkdir -p coverage
-          go test -coverprofile=coverage/coverage.out ./...
-          go tool cover -html=coverage/coverage.out -o coverage/coverage.html
+            - name: Make utility script executable
+              run: chmod +x scripts/backup-utils.sh
 
-      - name: Upload coverage reports
-        uses: codecov/codecov-action@v3
-        with:
-          file: ./coverage/coverage.out
-          flags: unittests
-          name: codecov-umbrella
+            - name: Validate environment variables
+              run: ./scripts/backup-utils.sh validate
 
-      - name: Run security scan
-        run: |
-          if command -v gosec >/dev/null 2>&1; then
-            gosec ./...
-          else
-            echo "gosec not available, skipping security scan"
-          fi
+            - name: Run backup script
+              id: backup
+              env:
+                  BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+                  WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+                  GITHUB_SERVER_URL: ${{ github.server_url }}
+                  GITHUB_REPOSITORY: ${{ github.repository }}
+                  GITHUB_RUN_ID: ${{ github.run_id }}
+              run: |
+                  echo "🚀 Starting backup process..."
+                  if ! go run backup.go; then
+                    echo "❌ Backup script failed"
+                    exit 1
+                  fi
+                  echo "✅ Backup script completed successfully"
 
-  backup:
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - name: Checkout backup repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.BACKUP_TOKEN }}
-          fetch-depth: 0
+            - name: Commit and push backups
+              id: commit
+              run: ./scripts/backup-utils.sh commit-push
 
-      - name: Setup Git user
-        run: |
-          git config --global user.name "Backup Bot"
-          git config --global user.email "ethank2222@gmail.com"
+            - name: Send final notification
+              if: always()
+              env:
+                  WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+                  GITHUB_SERVER_URL: ${{ github.server_url }}
+                  GITHUB_REPOSITORY: ${{ github.repository }}
+                  GITHUB_RUN_ID: ${{ github.run_id }}
+              run: ./scripts/backup-utils.sh send-notification "${{ job.status }}"
 
-      - name: Setup Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: "1.21"
+    cleanup:
+        name: Cleanup
+        runs-on: ubuntu-latest
+        needs: backup
+        if: always()
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: go mod download
+            - name: Setup Go
+              uses: actions/setup-go@v4
+              with:
+                  go-version: "1.21"
 
-      - name: Run backup script
-        env:
-          BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        run: |
-          go run backup.go
-
-      - name: Commit and push backups
-        id: commit
-        run: |
-          git add .
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-            echo "NO_CHANGES=true" >> $GITHUB_ENV
-          else
-            git commit -m "Daily mirror backup - $(date +%Y-%m-%d)"
-            git push origin main
-            echo "BACKUP_COMMITTED=true" >> $GITHUB_ENV
-          fi
-
-      - name: Send success notification
-        if: success()
-        run: |
-          # Count total repositories backed up
-          REPO_COUNT=$(grep -c "mirrored successfully" backup-log.txt || echo "0")
-
-          # Determine if new backups were created
-          if [ "${{ env.NO_CHANGES }}" = "true" ]; then
-            STATUS_MESSAGE="No new backups needed (repositories unchanged)"
-          else
-            STATUS_MESSAGE="$REPO_COUNT repositories backed up successfully"
-          fi
-
-          curl -H 'Content-Type: application/x-www-form-urlencoded' \
-            -d "title=✅ GitHub Backup Successful" \
-            -d "text=Backup successful on $(date +%Y-%m-%d) - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
-            "${{ secrets.WEBHOOK_URL }}"
-
-      - name: Send failure notification
-        if: failure()
-        run: |
-          curl -H 'Content-Type: application/x-www-form-urlencoded' \
-            -d "title=❌ GitHub Backup Failed" \
-            -d "text=Backup failed on $(date +%Y-%m-%d) - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
-            "${{ secrets.WEBHOOK_URL }}"
-
-      - name: Send notification on cancellation
-        if: cancelled()
-        run: |
-          curl -H 'Content-Type: application/x-www-form-urlencoded' \
-            -d "title=⚠️ GitHub Backup Cancelled" \
-            -d "text=Backup cancelled on $(date +%Y-%m-%d) - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
-            "${{ secrets.WEBHOOK_URL }}"
+            - name: Run cleanup checks
+              run: ./scripts/backup-utils.sh cleanup

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,47 +45,156 @@ type BackupSummary struct {
 	FailureCount   int             `json:"failure_count"`
 }
 
+// WebhookLogger handles sending log messages to webhook
+type WebhookLogger struct {
+	webhookURL string
+	client     *http.Client
+}
+
+// LogMessage represents a structured log message for webhook
+type LogMessage struct {
+	Level     string                 `json:"level"`
+	Message   string                 `json:"message"`
+	Timestamp time.Time              `json:"timestamp"`
+	Fields    map[string]interface{} `json:"fields,omitempty"`
+}
+
+// BackupManager handles the backup process
+type BackupManager struct {
+	logger      *slog.Logger
+	webhookLog  *WebhookLogger
+	backupToken string
+	backupDate  string
+}
+
+// NewBackupManager creates a new backup manager
+func NewBackupManager(backupToken, webhookURL string) *BackupManager {
+	// Setup structured logging
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	webhookLog := &WebhookLogger{
+		webhookURL: webhookURL,
+		client:     &http.Client{Timeout: 30 * time.Second},
+	}
+
+	return &BackupManager{
+		logger:      logger,
+		webhookLog:  webhookLog,
+		backupToken: backupToken,
+		backupDate:  time.Now().Format("2006-01-02"),
+	}
+}
+
+// Log sends a structured log message and optionally to webhook
+func (bm *BackupManager) Log(level slog.Level, msg string, fields ...interface{}) {
+	// Log to stdout
+	bm.logger.Log(level, msg, fields...)
+
+	// Send to webhook if URL is provided
+	if bm.webhookLog.webhookURL != "" {
+		webhookMsg := LogMessage{
+			Level:     level.String(),
+			Message:   msg,
+			Timestamp: time.Now(),
+		}
+
+		// Convert fields to map
+		if len(fields) > 0 {
+			webhookMsg.Fields = make(map[string]interface{})
+			for i := 0; i < len(fields); i += 2 {
+				if i+1 < len(fields) {
+					if key, ok := fields[i].(string); ok {
+						webhookMsg.Fields[key] = fields[i+1]
+					}
+				}
+			}
+		}
+
+		bm.webhookLog.Send(webhookMsg)
+	}
+}
+
+// Send sends a log message to the webhook
+func (wl *WebhookLogger) Send(msg LogMessage) {
+	if wl.webhookURL == "" {
+		return
+	}
+
+	jsonData, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	resp, err := wl.client.Post(wl.webhookURL, "application/json", strings.NewReader(string(jsonData)))
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+}
+
 func main() {
-	// Get required environment variable
+	// Get required environment variables
 	backupToken := os.Getenv("BACKUP_TOKEN")
 	if backupToken == "" {
 		log.Fatal("BACKUP_TOKEN environment variable is required")
 	}
 
-	// Set backup date
-	backupDate := time.Now().Format("2006-01-02")
+	webhookURL := os.Getenv("WEBHOOK_URL")
 
-	// Load repositories from file
-	repositories, err := loadRepositoriesFromFile("repositories.txt")
+	// Create backup manager
+	bm := NewBackupManager(backupToken, webhookURL)
+
+	// Start backup process
+	if err := bm.RunBackup(); err != nil {
+		bm.Log(slog.LevelError, "Backup process failed", "error", err.Error())
+		os.Exit(1)
+	}
+}
+
+// RunBackup executes the complete backup process
+func (bm *BackupManager) RunBackup() error {
+	bm.Log(slog.LevelInfo, "Starting backup process", "date", bm.backupDate)
+
+	// Load repositories
+	repositories, err := bm.loadRepositoriesFromFile("repositories.txt")
 	if err != nil {
-		log.Fatalf("Failed to load repositories: %v", err)
+		return fmt.Errorf("failed to load repositories: %w", err)
 	}
 
-	log.Printf("Starting backup process for %d repositories", len(repositories))
+	bm.Log(slog.LevelInfo, "Loaded repositories", "count", len(repositories))
 
 	// Create backup directories
-	if err := createBackupDirectories(repositories, backupDate); err != nil {
-		log.Fatalf("Failed to create backup directories: %v", err)
+	if err := bm.createBackupDirectories(repositories); err != nil {
+		return fmt.Errorf("failed to create backup directories: %w", err)
 	}
 
 	// Perform backups
-	summary := performBackups(repositories, backupToken, backupDate)
+	summary := bm.performBackups(repositories)
 
-	// Enforce retention: keep only 5 most recent backups per repo
-	enforceRetention(repositories)
+	// Enforce retention
+	bm.enforceRetention(repositories)
 
 	// Create summary
-	createBackupSummary(summary, backupDate)
+	if err := bm.createBackupSummary(summary); err != nil {
+		bm.Log(slog.LevelWarn, "Failed to create backup summary", "error", err.Error())
+	}
 
 	// Log final results
-	log.Printf("Backup completed. Success: %d, Failures: %d, Duration: %s", 
-		summary.SuccessCount, summary.FailureCount, summary.Duration)
+	bm.Log(slog.LevelInfo, "Backup completed", 
+		"success_count", summary.SuccessCount,
+		"failure_count", summary.FailureCount,
+		"duration", summary.Duration.String(),
+		"success_rate", fmt.Sprintf("%.1f%%", float64(summary.SuccessCount)/float64(len(summary.Results))*100))
+
+	return nil
 }
 
-func loadRepositoriesFromFile(filename string) ([]RepositoryConfig, error) {
+func (bm *BackupManager) loadRepositoriesFromFile(filename string) ([]RepositoryConfig, error) {
 	content, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read repositories file: %v", err)
+		return nil, fmt.Errorf("failed to read repositories file: %w", err)
 	}
 
 	var repositories []RepositoryConfig
@@ -98,9 +209,9 @@ func loadRepositoriesFromFile(filename string) ([]RepositoryConfig, error) {
 		}
 
 		// Extract repository name from URL
-		repoName, err := extractRepoNameFromURL(line)
+		repoName, err := bm.extractRepoNameFromURL(line)
 		if err != nil {
-			return nil, fmt.Errorf("invalid repository URL on line %d: %v", i+1, err)
+			return nil, fmt.Errorf("invalid repository URL on line %d: %w", i+1, err)
 		}
 
 		repositories = append(repositories, RepositoryConfig{
@@ -116,7 +227,7 @@ func loadRepositoriesFromFile(filename string) ([]RepositoryConfig, error) {
 	return repositories, nil
 }
 
-func extractRepoNameFromURL(url string) (string, error) {
+func (bm *BackupManager) extractRepoNameFromURL(url string) (string, error) {
 	url = strings.TrimSpace(url)
 	
 	// Remove .git suffix if present
@@ -150,112 +261,53 @@ func extractRepoNameFromURL(url string) (string, error) {
 	return "", fmt.Errorf("unable to extract repository name from URL: %s", url)
 }
 
-func createBackupDirectories(repositories []RepositoryConfig, backupDate string) error {
+func (bm *BackupManager) createBackupDirectories(repositories []RepositoryConfig) error {
 	for _, repo := range repositories {
-		backupPath := filepath.Join("backups", repo.Name, backupDate)
+		backupPath := filepath.Join("backups", repo.Name, bm.backupDate)
 		
 		// Remove existing backup for today if it exists
 		if err := os.RemoveAll(backupPath); err != nil {
-			log.Printf("Warning: Could not remove existing backup directory %s: %v", backupPath, err)
+			bm.Log(slog.LevelWarn, "Could not remove existing backup directory", 
+				"path", backupPath, "error", err.Error())
 		}
 
 		// Create fresh backup directory
 		if err := os.MkdirAll(backupPath, 0755); err != nil {
-			return fmt.Errorf("failed to create backup directory %s: %v", backupPath, err)
+			return fmt.Errorf("failed to create backup directory %s: %w", backupPath, err)
 		}
 
-		log.Printf("Created backup directory: %s", backupPath)
+		bm.Log(slog.LevelInfo, "Created backup directory", "path", backupPath)
 	}
 	return nil
 }
 
-func performBackups(repositories []RepositoryConfig, backupToken, backupDate string) BackupSummary {
+func (bm *BackupManager) performBackups(repositories []RepositoryConfig) BackupSummary {
 	summary := BackupSummary{
-		Date:      backupDate,
+		Date:      bm.backupDate,
 		StartTime: time.Now(),
 		Results:   []BackupResult{},
 	}
 
 	for _, repo := range repositories {
-		log.Printf("Starting backup of %s", repo.Name)
-
-		result := BackupResult{
-			Name:      repo.Name,
-			StartTime: time.Now(),
-		}
-
-		// Clone repository with retry
-		backupPath := filepath.Join("backups", repo.Name, backupDate, repo.Name+".git")
-		zipPath := backupPath + ".zip"
-
-		// Construct authenticated URL
-		repoURL := repo.URL
-		if strings.HasPrefix(repoURL, "https://") {
-			repoURL = strings.Replace(repoURL, "https://", fmt.Sprintf("https://%s@", backupToken), 1)
-		} else if strings.HasPrefix(repoURL, "git@") {
-			repoURL = strings.Replace(repoURL, "git@github.com:", fmt.Sprintf("https://%s@github.com/", backupToken), 1)
-		}
-
-		// Retry logic
-		maxRetries := 3
-		var lastError error
-
-		for attempt := 1; attempt <= maxRetries; attempt++ {
-			if err := cloneRepository(repoURL, backupPath); err != nil {
-				lastError = err
-				if attempt < maxRetries {
-					log.Printf("Git clone failed for %s (attempt %d/%d), retrying: %v", 
-						repo.Name, attempt, maxRetries, err)
-					time.Sleep(time.Duration(attempt) * time.Second)
-					continue
-				}
-			} else {
-				result.Success = true
-				break
-			}
-		}
-
-		if !result.Success {
-			result.Error = lastError.Error()
-		} else {
-			// Remove credentials from config
-			if err := removeCredentialsFromConfig(backupPath); err != nil {
-				log.Printf("Warning: Could not remove credentials from config for %s: %v", repo.Name, err)
-			}
-
-			// Calculate size
-			if size, err := getDirectorySize(backupPath); err == nil {
-				result.Size = size
-			}
-
-			// Compress to zip
-			if err := zipDirectory(backupPath, zipPath); err == nil {
-				if zipSize, err := getFileSize(zipPath); err == nil {
-					result.ZipSize = zipSize
-				}
-				// Delete the uncompressed .git folder
-				os.RemoveAll(backupPath)
-			} else {
-				log.Printf("Warning: Could not compress backup for %s: %v", repo.Name, err)
-			}
-
-			// Log success
-			logMessage := fmt.Sprintf("✅ %s mirrored and zipped successfully - %s\n", repo.Name, time.Now().Format("2006-01-02 15:04:05"))
-			appendToLog("backup-log.txt", logMessage)
-		}
-
-		result.EndTime = time.Now()
-		result.Duration = result.EndTime.Sub(result.StartTime)
+		bm.Log(slog.LevelInfo, "Starting backup", "repository", repo.Name)
+		
+		result := bm.backupRepository(repo)
+		summary.Results = append(summary.Results, result)
 
 		if result.Success {
 			summary.SuccessCount++
-			log.Printf("✅ %s backed up and zipped successfully (%s) in %s", repo.Name, result.ZipSize, result.Duration)
+			bm.Log(slog.LevelInfo, "Repository backup completed", 
+				"repository", repo.Name, 
+				"size", result.Size,
+				"zip_size", result.ZipSize,
+				"duration", result.Duration.String())
 		} else {
 			summary.FailureCount++
-			log.Printf("❌ %s backup failed: %s", repo.Name, result.Error)
+			bm.Log(slog.LevelError, "Repository backup failed", 
+				"repository", repo.Name, 
+				"error", result.Error,
+				"duration", result.Duration.String())
 		}
-
-		summary.Results = append(summary.Results, result)
 	}
 
 	summary.EndTime = time.Now()
@@ -264,15 +316,95 @@ func performBackups(repositories []RepositoryConfig, backupToken, backupDate str
 	return summary
 }
 
-func cloneRepository(repoURL, backupPath string) error {
-	cmd := exec.Command("git", "clone", "--mirror", repoURL, backupPath)
+func (bm *BackupManager) backupRepository(repo RepositoryConfig) BackupResult {
+	result := BackupResult{
+		Name:      repo.Name,
+		StartTime: time.Now(),
+	}
+
+	// Clone repository with retry
+	backupPath := filepath.Join("backups", repo.Name, bm.backupDate, repo.Name+".git")
+	zipPath := backupPath + ".zip"
+
+	// Construct authenticated URL
+	repoURL := bm.constructAuthenticatedURL(repo.URL)
+
+	// Retry logic
+	maxRetries := 3
+	var lastError error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := bm.cloneRepository(repoURL, backupPath); err != nil {
+			lastError = err
+			if attempt < maxRetries {
+				bm.Log(slog.LevelWarn, "Git clone failed, retrying", 
+					"repository", repo.Name, 
+					"attempt", attempt, 
+					"max_attempts", maxRetries, 
+					"error", err.Error())
+				time.Sleep(time.Duration(attempt) * time.Second)
+				continue
+			}
+		} else {
+			result.Success = true
+			break
+		}
+	}
+
+	if !result.Success {
+		result.Error = lastError.Error()
+	} else {
+		// Remove credentials from config
+		if err := bm.removeCredentialsFromConfig(backupPath); err != nil {
+			bm.Log(slog.LevelWarn, "Could not remove credentials from config", 
+				"repository", repo.Name, "error", err.Error())
+		}
+
+		// Calculate size
+		if size, err := bm.getDirectorySize(backupPath); err == nil {
+			result.Size = size
+		}
+
+		// Compress to zip
+		if err := bm.zipDirectory(backupPath, zipPath); err == nil {
+			if zipSize, err := bm.getFileSize(zipPath); err == nil {
+				result.ZipSize = zipSize
+			}
+			// Delete the uncompressed .git folder
+			os.RemoveAll(backupPath)
+		} else {
+			bm.Log(slog.LevelWarn, "Could not compress backup", 
+				"repository", repo.Name, "error", err.Error())
+		}
+	}
+
+	result.EndTime = time.Now()
+	result.Duration = result.EndTime.Sub(result.StartTime)
+
+	return result
+}
+
+func (bm *BackupManager) constructAuthenticatedURL(url string) string {
+	if strings.HasPrefix(url, "https://") {
+		return strings.Replace(url, "https://", fmt.Sprintf("https://%s@", bm.backupToken), 1)
+	} else if strings.HasPrefix(url, "git@") {
+		return strings.Replace(url, "git@github.com:", fmt.Sprintf("https://%s@github.com/", bm.backupToken), 1)
+	}
+	return url
+}
+
+func (bm *BackupManager) cloneRepository(repoURL, backupPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "clone", "--mirror", repoURL, backupPath)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git clone failed: %v, output: %s", err, string(output))
+		return fmt.Errorf("git clone failed: %w, output: %s", err, string(output))
 	}
 	return nil
 }
 
-func removeCredentialsFromConfig(gitPath string) error {
+func (bm *BackupManager) removeCredentialsFromConfig(gitPath string) error {
 	configPath := filepath.Join(gitPath, "config")
 	
 	content, err := os.ReadFile(configPath)
@@ -280,15 +412,14 @@ func removeCredentialsFromConfig(gitPath string) error {
 		return err
 	}
 	
-	token := os.Getenv("BACKUP_TOKEN")
 	newContent := strings.ReplaceAll(string(content), 
-		fmt.Sprintf("https://%s@github.com", token), 
+		fmt.Sprintf("https://%s@github.com", bm.backupToken), 
 		"https://github.com")
 	
 	return os.WriteFile(configPath, []byte(newContent), 0644)
 }
 
-func getDirectorySize(path string) (string, error) {
+func (bm *BackupManager) getDirectorySize(path string) (string, error) {
 	cmd := exec.Command("du", "-sh", path)
 	output, err := cmd.Output()
 	if err != nil {
@@ -302,25 +433,32 @@ func getDirectorySize(path string) (string, error) {
 	return "unknown", nil
 }
 
-func createBackupSummary(summary BackupSummary, backupDate string) {
-	summaryDir := filepath.Join("backups", "summary", backupDate)
+func (bm *BackupManager) createBackupSummary(summary BackupSummary) error {
+	summaryDir := filepath.Join("backups", "summary", bm.backupDate)
 	if err := os.MkdirAll(summaryDir, 0755); err != nil {
-		log.Printf("Error creating summary directory: %v", err)
-		return
+		return fmt.Errorf("failed to create summary directory: %w", err)
 	}
 
 	// Create markdown summary
 	summaryPath := filepath.Join(summaryDir, "README.md")
-	createMarkdownSummary(summaryPath, summary)
+	if err := bm.createMarkdownSummary(summaryPath, summary); err != nil {
+		return fmt.Errorf("failed to create markdown summary: %w", err)
+	}
 
 	// Create JSON summary
 	jsonPath := filepath.Join(summaryDir, "summary.json")
-	createJSONSummary(jsonPath, summary)
+	if err := bm.createJSONSummary(jsonPath, summary); err != nil {
+		return fmt.Errorf("failed to create JSON summary: %w", err)
+	}
 
-	log.Printf("Created backup summaries: %s, %s", summaryPath, jsonPath)
+	bm.Log(slog.LevelInfo, "Created backup summaries", 
+		"markdown_path", summaryPath, 
+		"json_path", jsonPath)
+
+	return nil
 }
 
-func createMarkdownSummary(path string, summary BackupSummary) {
+func (bm *BackupManager) createMarkdownSummary(path string, summary BackupSummary) error {
 	var content strings.Builder
 	content.WriteString(fmt.Sprintf("# Backup Summary - %s\n\n", summary.Date))
 	content.WriteString(fmt.Sprintf("**Start Time:** %s\n", summary.StartTime.Format("2006-01-02 15:04:05")))
@@ -355,57 +493,58 @@ func createMarkdownSummary(path string, summary BackupSummary) {
 		content.WriteString("\n```\n")
 	}
 
-	os.WriteFile(path, []byte(content.String()), 0644)
+	return os.WriteFile(path, []byte(content.String()), 0644)
 }
 
-func createJSONSummary(path string, summary BackupSummary) {
+func (bm *BackupManager) createJSONSummary(path string, summary BackupSummary) error {
 	jsonData, err := json.MarshalIndent(summary, "", "  ")
 	if err != nil {
-		log.Printf("Failed to marshal summary: %v", err)
-		return
+		return fmt.Errorf("failed to marshal summary: %w", err)
 	}
-	os.WriteFile(path, jsonData, 0644)
+	return os.WriteFile(path, jsonData, 0644)
 }
 
-func appendToLog(logFile, message string) {
-	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	
-	f.WriteString(message)
-} 
-
 // enforceRetention keeps only the 5 most recent backup folders per repo, deleting the oldest.
-func enforceRetention(repositories []RepositoryConfig) {
+func (bm *BackupManager) enforceRetention(repositories []RepositoryConfig) {
 	const maxBackups = 5
 	for _, repo := range repositories {
 		repoPath := filepath.Join("backups", repo.Name)
 		entries, err := os.ReadDir(repoPath)
 		if err != nil {
-			continue // skip if can't read dir
+			bm.Log(slog.LevelWarn, "Could not read repository directory", 
+				"repository", repo.Name, "error", err.Error())
+			continue
 		}
+		
 		var backupDirs []string
 		for _, entry := range entries {
-			if entry.IsDir() && isDateDir(entry.Name()) {
+			if entry.IsDir() && bm.isDateDir(entry.Name()) {
 				backupDirs = append(backupDirs, entry.Name())
 			}
 		}
+		
 		if len(backupDirs) <= maxBackups {
 			continue
 		}
+		
 		// Sort oldest to newest
 		sort.Strings(backupDirs)
 		toDelete := backupDirs[:len(backupDirs)-maxBackups]
+		
 		for _, dir := range toDelete {
-			os.RemoveAll(filepath.Join(repoPath, dir))
+			dirPath := filepath.Join(repoPath, dir)
+			if err := os.RemoveAll(dirPath); err != nil {
+				bm.Log(slog.LevelWarn, "Could not remove old backup directory", 
+					"path", dirPath, "error", err.Error())
+			} else {
+				bm.Log(slog.LevelInfo, "Removed old backup directory", "path", dirPath)
+			}
 		}
 	}
 }
 
 // isDateDir returns true if the directory name looks like a date (YYYY-MM-DD)
-func isDateDir(name string) bool {
+func (bm *BackupManager) isDateDir(name string) bool {
 	if len(name) != 10 {
 		return false
 	}
@@ -425,7 +564,7 @@ func isDateDir(name string) bool {
 } 
 
 // zipDirectory compresses the given directory into a zip file at zipPath
-func zipDirectory(srcDir, zipPath string) error {
+func (bm *BackupManager) zipDirectory(srcDir, zipPath string) error {
 	zipFile, err := os.Create(zipPath)
 	if err != nil {
 		return err
@@ -478,16 +617,16 @@ func zipDirectory(srcDir, zipPath string) error {
 }
 
 // getFileSize returns the size of the file at path as a human-readable string
-func getFileSize(path string) (string, error) {
+func (bm *BackupManager) getFileSize(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", err
 	}
-	return byteCountDecimal(info.Size()), nil
+	return bm.byteCountDecimal(info.Size()), nil
 }
 
 // byteCountDecimal returns a human-readable file size
-func byteCountDecimal(b int64) string {
+func (bm *BackupManager) byteCountDecimal(b int64) string {
 	const unit = 1000
 	if b < unit {
 		return fmt.Sprintf("%d B", b)
