@@ -25,9 +25,6 @@ jobs:
               with:
                   go-version: "1.21"
 
-            - name: Install dependencies
-              run: go mod download
-
             - name: Make utility script executable
               run: chmod +x scripts/backup-utils.sh
 
