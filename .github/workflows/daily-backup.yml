@@ -25,14 +25,20 @@ jobs:
               with:
                   go-version: "1.21"
 
-            - name: Make utility script executable
-              run: chmod +x scripts/backup-utils.sh
-
-            - name: Validate environment variables
+            - name: Validate environment
               env:
                   BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
                   GITHUB_REPOSITORY: ${{ github.repository }}
-              run: ./scripts/backup-utils.sh validate
+              run: |
+                  if [ -z "$BACKUP_TOKEN" ]; then
+                    echo "❌ Error: BACKUP_TOKEN not set"
+                    exit 1
+                  fi
+                  if [ ! -f repositories.txt ]; then
+                    echo "❌ Error: repositories.txt not found"
+                    exit 1
+                  fi
+                  echo "✅ Environment validated"
 
             - name: Run backup script
               id: backup
@@ -50,12 +56,24 @@ jobs:
                   fi
                   echo "✅ Backup script completed successfully"
 
-            - name: Commit and push backups
-              id: commit
-              env:
-                  BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
-                  GITHUB_REPOSITORY: ${{ github.repository }}
-              run: ./scripts/backup-utils.sh commit-push
+            - name: Check for changes
+              id: changes
+              run: |
+                  if git diff --quiet; then
+                    echo "no_changes=true" >> $GITHUB_OUTPUT
+                    echo "ℹ️  No changes to commit"
+                  else
+                    echo "no_changes=false" >> $GITHUB_OUTPUT
+                    echo "ℹ️  Changes detected"
+                  fi
+
+            - name: Commit and push changes
+              if: steps.changes.outputs.no_changes != 'true'
+              run: |
+                  git add .
+                  git commit -m "Daily mirror backup - $(date +%Y-%m-%d)"
+                  git push origin main
+                  echo "✅ Changes committed and pushed"
 
     cleanup:
         name: Cleanup
@@ -71,10 +89,19 @@ jobs:
               with:
                   go-version: "1.21"
 
-            - name: Make utility script executable
-              run: chmod +x scripts/backup-utils.sh
-
             - name: Run cleanup checks
               env:
                   GITHUB_REPOSITORY: ${{ github.repository }}
-              run: ./scripts/backup-utils.sh cleanup
+              run: |
+                  echo "ℹ️  Running cleanup checks..."
+                  if [ -f backup-results.json ]; then
+                    echo "ℹ️  Found backup results file"
+                  fi
+                  if [ -d backups ]; then
+                    echo "ℹ️  Backup directory exists"
+                    zip_count=$(find backups -name "*.zip" 2>/dev/null | wc -l)
+                    echo "  - ZIP files: $zip_count"
+                  else
+                    echo "⚠️  No backup directory found"
+                  fi
+                  echo "✅ Cleanup checks completed"

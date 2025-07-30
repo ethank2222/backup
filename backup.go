@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/zip"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,43 +10,78 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// Config holds the backup configuration
+// Config holds application configuration
 type Config struct {
-	Token      string   `json:"token"`
-	WebhookURL string   `json:"webhook_url"`
-	Repos      []string `json:"repos"`
-	MaxBackups int      `json:"max_backups"`
+	Repos []string
 }
 
-// Result represents a single backup result
+// Result represents the result of backing up a single repository
 type Result struct {
-	Repo      string        `json:"repo"`
-	Success   bool          `json:"success"`
-	Error     string        `json:"error,omitempty"`
-	Size      string        `json:"size,omitempty"`
-	ZipSize   string        `json:"zip_size,omitempty"`
-	Duration  time.Duration `json:"duration"`
+	Repo     string
+	Success  bool
+	Error    string
+	Size     int64
+	ZipSize  int64
+	Duration time.Duration
 }
 
 // Summary holds the overall backup summary
 type Summary struct {
-	Date      string    `json:"date"`
-	StartTime time.Time `json:"start_time"`
-	EndTime   time.Time `json:"end_time"`
-	Duration  time.Duration `json:"duration"`
-	Results   []Result  `json:"results"`
-	Success   int        `json:"success_count"`
-	Failed    int        `json:"failed_count"`
+	Total    int
+	Success  int
+	Failed   int
+	Results  []Result
+	Duration time.Duration
 }
 
 func main() {
 	// Set up logging with timestamp
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	
+	// Track backup summary
+	var summary Summary
+	
+	// Ensure notification is always sent, even on panic
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("❌ Panic occurred: %v", r)
+			sendNotification("panic", "Backup process panicked", []string{})
+			return
+		}
+		
+		// Send appropriate notification based on backup result
+		if summary.Total == 0 {
+			// No backup was attempted (early failure)
+			sendNotification("failure", "Backup process failed before starting", []string{})
+		} else if summary.Failed == summary.Total {
+			// All backups failed
+			sendNotification("failure", "All backups failed", []string{})
+		} else if summary.Failed > 0 {
+			// Some backups failed
+			var successfulRepos []string
+			for _, result := range summary.Results {
+				if result.Success {
+					successfulRepos = append(successfulRepos, extractRepoName(result.Repo))
+				}
+			}
+			sendNotification("failure", "Some backups failed", successfulRepos)
+		} else {
+			// All backups succeeded
+			var successfulRepos []string
+			for _, result := range summary.Results {
+				if result.Success {
+					successfulRepos = append(successfulRepos, extractRepoName(result.Repo))
+				}
+			}
+			sendNotification("success", "Backup completed successfully", successfulRepos)
+		}
+	}()
 	
 	// Validate environment
 	if err := validateEnvironment(); err != nil {
@@ -71,7 +105,7 @@ func main() {
 	}
 	
 	// Run backup
-	summary := runBackup(config)
+	summary = runBackup(config)
 	
 	// Save backup results
 	if err := saveBackupResults(summary); err != nil {
@@ -79,14 +113,9 @@ func main() {
 	}
 	
 	// Commit and push changes
-	noChanges, err := commitAndPush()
+	_, err = commitAndPush()
 	if err != nil {
 		log.Printf("Warning: Failed to commit/push: %v", err)
-	}
-	
-	// Send notification
-	if config.WebhookURL != "" {
-		sendNotification(config.WebhookURL, summary, noChanges)
 	}
 	
 	// Print summary
@@ -102,277 +131,307 @@ func main() {
 }
 
 func validateEnvironment() error {
-	log.Printf("ℹ️  Validating environment variables...")
-	
+	// Check for required environment variables
 	if os.Getenv("BACKUP_TOKEN") == "" {
 		return fmt.Errorf("BACKUP_TOKEN environment variable is required")
 	}
 	
-	if os.Getenv("GITHUB_REPOSITORY") == "" {
-		return fmt.Errorf("GITHUB_REPOSITORY environment variable is required")
+	// Check for required files
+	if _, err := os.Stat("repositories.txt"); os.IsNotExist(err) {
+		return fmt.Errorf("repositories.txt file is required")
 	}
 	
-	// Validate Git is available
+	// Check for required commands
 	if _, err := exec.LookPath("git"); err != nil {
-		return fmt.Errorf("git command not found: %w", err)
+		return fmt.Errorf("git command is required but not found")
 	}
 	
-	// Validate du command is available (for size calculation)
+	// du command is optional (we have fallback)
 	if _, err := exec.LookPath("du"); err != nil {
-		log.Printf("Warning: du command not found, size calculation may fail")
+		log.Printf("Warning: du command not found, will use fallback size calculation")
 	}
 	
-	log.Printf("✅ Environment variables validated")
 	return nil
 }
 
 func setupGit() error {
-	log.Printf("ℹ️  Setting up Git configuration...")
-	
-	// Set Git user name
+	// Configure Git user
 	cmd := exec.Command("git", "config", "--global", "user.name", "Backup Bot")
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to set git user name: %w", err)
+		return fmt.Errorf("failed to set git user name: %v", err)
 	}
 	
-	// Set Git user email
 	cmd = exec.Command("git", "config", "--global", "user.email", "ethank2222@gmail.com")
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to set git user email: %w", err)
+		return fmt.Errorf("failed to set git user email: %v", err)
 	}
 	
-	log.Printf("✅ Git configuration completed")
 	return nil
 }
 
 func loadConfig() (Config, error) {
-	token := os.Getenv("BACKUP_TOKEN")
-	
-	// Read repositories from file
 	content, err := os.ReadFile("repositories.txt")
 	if err != nil {
-		return Config{}, fmt.Errorf("failed to read repositories.txt: %w", err)
+		return Config{}, fmt.Errorf("failed to read repositories.txt: %v", err)
 	}
 	
 	var repos []string
-	for i, line := range strings.Split(string(content), "\n") {
+	lines := strings.Split(string(content), "\n")
+	
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+		if line != "" && !strings.HasPrefix(line, "#") {
+			if isValidRepoURL(line) {
+				repos = append(repos, line)
+			} else {
+				log.Printf("Warning: Invalid repository URL: %s", line)
+			}
 		}
-		
-		// Validate repository URL
-		if !isValidRepoURL(line) {
-			log.Printf("Warning: Invalid repository URL on line %d: %s", i+1, line)
-			continue
-		}
-		
-		repos = append(repos, line)
 	}
 	
 	if len(repos) == 0 {
 		return Config{}, fmt.Errorf("no valid repositories found in repositories.txt")
 	}
 	
-	return Config{
-		Token:      token,
-		WebhookURL: os.Getenv("WEBHOOK_URL"),
-		Repos:      repos,
-		MaxBackups: 5,
-	}, nil
+	return Config{Repos: repos}, nil
 }
 
 func isValidRepoURL(url string) bool {
-	url = strings.TrimSpace(url)
-	return strings.HasPrefix(url, "https://github.com/") || 
-		   strings.HasPrefix(url, "git@github.com:")
+	// Basic GitHub URL validation
+	pattern := `^https://github\.com/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+(/.*)?$`
+	matched, _ := regexp.MatchString(pattern, url)
+	return matched
 }
 
 func runBackup(config Config) Summary {
-	date := time.Now().Format("2006-01-02")
-	summary := Summary{
-		Date:      date,
-		StartTime: time.Now(),
-		Results:   []Result{},
-	}
+	start := time.Now()
+	var results []Result
 	
-	log.Printf("Starting backup for %d repositories", len(config.Repos))
-	
-	// Create backup directories and backup repositories
+	// Create backup directories
 	for _, repo := range config.Repos {
 		repoName := extractRepoName(repo)
 		if repoName == "" {
-			log.Printf("Warning: Could not extract repo name from %s", repo)
+			log.Printf("❌ Failed to extract repo name from: %s", repo)
+			results = append(results, Result{
+				Repo:    repo,
+				Success: false,
+				Error:   "Failed to extract repository name",
+			})
 			continue
 		}
 		
-		backupDir := filepath.Join("backups", repoName, date)
+		backupDir := filepath.Join("backups", repoName, time.Now().Format("2006-01-02"))
 		if err := os.MkdirAll(backupDir, 0755); err != nil {
-			log.Printf("Warning: Failed to create backup directory %s: %v", backupDir, err)
+			log.Printf("❌ Failed to create backup directory for %s: %v", repoName, err)
+			results = append(results, Result{
+				Repo:    repo,
+				Success: false,
+				Error:   fmt.Sprintf("Failed to create backup directory: %v", err),
+			})
 			continue
 		}
 		
-		result := backupRepo(config.Token, repo, repoName, backupDir)
-		summary.Results = append(summary.Results, result)
-		
+		// Backup the repository
+		result := backupRepo(repo, repoName, backupDir)
+		results = append(results, result)
+	}
+	
+	// Calculate summary
+	success := 0
+	failed := 0
+	for _, result := range results {
 		if result.Success {
-			summary.Success++
+			success++
 		} else {
-			summary.Failed++
+			failed++
 		}
 	}
 	
-	// Enforce retention
-	enforceRetention(config.Repos, config.MaxBackups)
-	
-	summary.EndTime = time.Now()
-	summary.Duration = summary.EndTime.Sub(summary.StartTime)
-	
-	return summary
+	return Summary{
+		Total:    len(results),
+		Success:  success,
+		Failed:   failed,
+		Results:  results,
+		Duration: time.Since(start),
+	}
 }
 
-func extractRepoName(url string) string {
-	url = strings.TrimSuffix(url, ".git")
-	parts := strings.Split(url, "/")
+func extractRepoName(repoURL string) string {
+	if repoURL == "" {
+		return ""
+	}
+	
+	// Remove trailing slash and .git if present
+	repoURL = strings.TrimSuffix(repoURL, "/")
+	repoURL = strings.TrimSuffix(repoURL, ".git")
+	
+	// Split by / and get the last two parts
+	parts := strings.Split(repoURL, "/")
 	if len(parts) < 2 {
 		return ""
 	}
-	return parts[len(parts)-1]
+	
+	// Return owner/repo format
+	return fmt.Sprintf("%s/%s", parts[len(parts)-2], parts[len(parts)-1])
 }
 
-func backupRepo(token, repoURL, repoName, backupDir string) Result {
-	start := time.Now()
-	result := Result{Repo: repoName}
-	
-	// Validate inputs
-	if token == "" || repoURL == "" || repoName == "" || backupDir == "" {
-		result.Error = "invalid input parameters"
-		result.Duration = time.Since(start)
-		return result
+func backupRepo(repoURL, repoName, backupDir string) Result {
+	if repoURL == "" || repoName == "" || backupDir == "" {
+		return Result{
+			Repo:    repoURL,
+			Success: false,
+			Error:   "Invalid parameters provided",
+		}
 	}
+	
+	start := time.Now()
 	
 	// Construct authenticated URL
-	authURL := strings.Replace(repoURL, "https://", fmt.Sprintf("https://%s@", token), 1)
+	authURL := constructAuthenticatedURL(repoURL)
 	
 	// Clone repository
-	gitPath := filepath.Join(backupDir, repoName+".git")
-	zipPath := gitPath + ".zip"
-	
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	
-	cmd := exec.CommandContext(ctx, "git", "clone", "--mirror", authURL, gitPath)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		result.Error = fmt.Sprintf("clone failed: %v, output: %s", err, string(output))
-		result.Duration = time.Since(start)
-		return result
-	}
-	
-	// Remove credentials from config
-	removeCredentials(gitPath, token)
-	
-	// Calculate size
-	if size, err := getDirSize(gitPath); err == nil {
-		result.Size = size
-	}
-	
-	// Compress to zip
-	if err := zipDir(gitPath, zipPath); err == nil {
-		// Get zip size
-		if zipSize, err := getFileSize(zipPath); err == nil {
-			result.ZipSize = zipSize
+	if err := cloneRepository(authURL, backupDir); err != nil {
+		return Result{
+			Repo:    repoURL,
+			Success: false,
+			Error:   fmt.Sprintf("Clone failed: %v", err),
 		}
-		// Remove uncompressed directory
-		os.RemoveAll(gitPath)
-	} else {
-		log.Printf("Warning: failed to compress %s: %v", repoName, err)
 	}
 	
-	result.Success = true
-	result.Duration = time.Since(start)
-	return result
-}
-
-func removeCredentials(gitPath, token string) {
-	configPath := filepath.Join(gitPath, "config")
-	content, err := os.ReadFile(configPath)
+	// Get directory size
+	size, err := getDirectorySize(backupDir)
 	if err != nil {
-		return
+		log.Printf("Warning: Failed to get directory size for %s: %v", repoName, err)
 	}
 	
-	newContent := strings.ReplaceAll(string(content), 
-		fmt.Sprintf("https://%s@github.com", token), 
-		"https://github.com")
+	// Create ZIP file
+	zipPath := backupDir + ".zip"
+	if err := zipDirectory(backupDir, zipPath); err != nil {
+		// Clean up backup directory on ZIP failure
+		if cleanupErr := os.RemoveAll(backupDir); cleanupErr != nil {
+			log.Printf("Warning: Failed to cleanup backup directory after ZIP failure: %v", cleanupErr)
+		}
+		return Result{
+			Repo:    repoURL,
+			Success: false,
+			Error:   fmt.Sprintf("ZIP creation failed: %v", err),
+		}
+	}
 	
-	os.WriteFile(configPath, []byte(newContent), 0644)
+	// Get ZIP file size
+	zipSize, err := getFileSize(zipPath)
+	if err != nil {
+		log.Printf("Warning: Failed to get ZIP size for %s: %v", repoName, err)
+	}
+	
+	// Remove original directory
+	if err := os.RemoveAll(backupDir); err != nil {
+		log.Printf("Warning: Failed to remove backup directory for %s: %v", repoName, err)
+	}
+	
+	duration := time.Since(start)
+	log.Printf("✅ Backed up %s (%s -> %s)", repoName, byteCountDecimal(size), byteCountDecimal(zipSize))
+	
+	return Result{
+		Repo:     repoURL,
+		Success:  true,
+		Size:     size,
+		ZipSize:  zipSize,
+		Duration: duration,
+	}
 }
 
-func getDirSize(path string) (string, error) {
-	cmd := exec.Command("du", "-sh", path)
+func constructAuthenticatedURL(repoURL string) string {
+	token := os.Getenv("BACKUP_TOKEN")
+	if token == "" {
+		return repoURL
+	}
+	
+	// Replace https:// with https://token@
+	return strings.Replace(repoURL, "https://", fmt.Sprintf("https://%s@", token), 1)
+}
+
+func cloneRepository(repoURL, backupDir string) error {
+	cmd := exec.Command("git", "clone", "--mirror", repoURL, backupDir)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func getDirectorySize(dir string) (int64, error) {
+	// Try du command first (Unix/Linux)
+	cmd := exec.Command("du", "-sb", dir)
 	output, err := cmd.Output()
-	if err != nil {
-		return "", err
+	if err == nil {
+		// Parse output: "123456\t/path/to/dir"
+		parts := strings.Fields(string(output))
+		if len(parts) >= 1 {
+			size, err := strconv.ParseInt(parts[0], 10, 64)
+			if err == nil {
+				return size, nil
+			}
+		}
 	}
 	
-	parts := strings.Fields(string(output))
-	if len(parts) >= 1 {
-		return parts[0], nil
-	}
-	return "unknown", nil
-}
-
-func getFileSize(path string) (string, error) {
-	info, err := os.Stat(path)
+	// Fallback: calculate size manually
+	var totalSize int64
+	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			totalSize += info.Size()
+		}
+		return nil
+	})
+	
 	if err != nil {
-		return "", err
+		return 0, fmt.Errorf("failed to calculate directory size: %v", err)
 	}
-	return byteCountDecimal(info.Size()), nil
+	
+	return totalSize, nil
 }
 
-func byteCountDecimal(b int64) string {
-	const unit = 1000
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "kMGTPE"[exp])
-}
-
-func zipDir(srcDir, zipPath string) error {
-	zipFile, err := os.Create(zipPath)
+func zipDirectory(sourceDir, zipPath string) error {
+	zipfile, err := os.Create(zipPath)
 	if err != nil {
 		return err
 	}
-	defer zipFile.Close()
+	defer zipfile.Close()
 	
-	zipWriter := zip.NewWriter(zipFile)
-	defer zipWriter.Close()
+	archive := zip.NewWriter(zipfile)
+	defer archive.Close()
 	
-	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+	return filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		
-		relPath, err := filepath.Rel(filepath.Dir(srcDir), path)
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		
+		// Get relative path
+		relPath, err := filepath.Rel(sourceDir, path)
+		if err != nil {
+			return err
+		}
+		header.Name = relPath
+		
+		if info.IsDir() {
+			header.Name += "/"
+		} else {
+			header.Method = zip.Deflate
+		}
+		
+		writer, err := archive.CreateHeader(header)
 		if err != nil {
 			return err
 		}
 		
 		if info.IsDir() {
-			if path == srcDir {
-				return nil
-			}
-			header := &zip.FileHeader{
-				Name:     relPath + "/",
-				Method:   zip.Deflate,
-				Modified: info.ModTime(),
-			}
-			_, err := zipWriter.CreateHeader(header)
-			return err
+			return nil
 		}
 		
 		file, err := os.Open(path)
@@ -381,157 +440,172 @@ func zipDir(srcDir, zipPath string) error {
 		}
 		defer file.Close()
 		
-		header, err := zip.FileInfoHeader(info)
-		if err != nil {
-			return err
-		}
-		header.Name = relPath
-		header.Method = zip.Deflate
-		
-		writer, err := zipWriter.CreateHeader(header)
-		if err != nil {
-			return err
-		}
-		
 		_, err = io.Copy(writer, file)
 		return err
 	})
 }
 
-func enforceRetention(repos []string, maxBackups int) {
-	for _, repo := range repos {
-		repoName := extractRepoName(repo)
-		if repoName == "" {
-			continue
-		}
-		
-		repoPath := filepath.Join("backups", repoName)
-		
-		entries, err := os.ReadDir(repoPath)
-		if err != nil {
-			continue
-		}
-		
-		var backupDirs []string
-		for _, entry := range entries {
-			if entry.IsDir() && isDateDir(entry.Name()) {
-				backupDirs = append(backupDirs, entry.Name())
-			}
-		}
-		
-		if len(backupDirs) <= maxBackups {
-			continue
-		}
-		
-		// Sort and remove oldest
-		sort.Strings(backupDirs)
-		toDelete := backupDirs[:len(backupDirs)-maxBackups]
-		
-		for _, dir := range toDelete {
-			dirPath := filepath.Join(repoPath, dir)
-			os.RemoveAll(dirPath)
-		}
+func getFileSize(filePath string) (int64, error) {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return 0, err
 	}
+	return info.Size(), nil
 }
 
-func isDateDir(name string) bool {
-	if len(name) != 10 {
-		return false
+func byteCountDecimal(bytes int64) string {
+	const unit = 1000
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
 	}
-	for i, c := range name {
-		switch i {
-		case 4, 7:
-			if c != '-' {
-				return false
-			}
-		default:
-			if c < '0' || c > '9' {
-				return false
-			}
-		}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
 	}
-	return true
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "kMGTPE"[exp])
 }
 
 func saveBackupResults(summary Summary) error {
-	jsonData, err := json.MarshalIndent(summary, "", "  ")
+	data, err := json.MarshalIndent(summary, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal summary: %w", err)
+		return fmt.Errorf("failed to marshal summary: %v", err)
 	}
 	
-	return os.WriteFile("backup-results.json", jsonData, 0644)
+	return os.WriteFile("backup-results.json", data, 0644)
 }
 
 func commitAndPush() (bool, error) {
-	log.Printf("ℹ️  Checking for changes to commit...")
-	
-	// Add all files
-	cmd := exec.Command("git", "add", ".")
-	if err := cmd.Run(); err != nil {
-		return false, fmt.Errorf("failed to add files: %w", err)
+	// Check if there are changes
+	cmd := exec.Command("git", "status", "--porcelain")
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to check git status: %v", err)
 	}
 	
-	// Check if there are staged changes
+	// Check if output is empty (no changes)
+	if len(strings.TrimSpace(string(output))) == 0 {
+		log.Println("ℹ️  No changes to commit")
+		return true, nil
+	}
+	
+	// Add all changes
+	cmd = exec.Command("git", "add", ".")
+	if err := cmd.Run(); err != nil {
+		return false, fmt.Errorf("failed to add changes: %v", err)
+	}
+	
+	// Check if there are staged changes after adding
 	cmd = exec.Command("git", "diff", "--staged", "--quiet")
 	if err := cmd.Run(); err != nil {
-		// There are changes to commit
-		log.Printf("ℹ️  Committing changes...")
-		
+		// There are staged changes, proceed with commit
 		commitMsg := fmt.Sprintf("Daily mirror backup - %s", time.Now().Format("2006-01-02"))
 		cmd = exec.Command("git", "commit", "-m", commitMsg)
 		if err := cmd.Run(); err != nil {
-			return false, fmt.Errorf("failed to commit: %w", err)
+			return false, fmt.Errorf("failed to commit changes: %v", err)
 		}
 		
-		log.Printf("ℹ️  Pushing to repository...")
+		// Push changes
 		cmd = exec.Command("git", "push", "origin", "main")
 		if err := cmd.Run(); err != nil {
-			return false, fmt.Errorf("failed to push: %w", err)
+			return false, fmt.Errorf("failed to push changes: %v", err)
 		}
 		
-		log.Printf("✅ Changes pushed successfully")
-		return false, nil // false = changes were made
+		log.Println("✅ Changes committed and pushed")
+		return false, nil
 	}
 	
-	log.Printf("ℹ️  No changes to commit")
-	return true, nil // true = no changes
+	// No staged changes after adding
+	log.Println("ℹ️  No changes to commit after adding")
+	return true, nil
 }
 
-func sendNotification(webhookURL string, summary Summary, noChanges bool) {
-	// Validate webhook URL
+func sendNotification(status, message string, successfulRepos []string) {
+	webhookURL := os.Getenv("WEBHOOK_URL")
 	if webhookURL == "" {
+		log.Println("⚠️  No webhook URL configured, skipping notification")
 		return
 	}
 	
-	// Determine status and color
-	status := "Success"
-	color := "Good"
-	title := "✅ GitHub Backup Successful"
-	message := "Backup completed successfully"
-	
-	if summary.Failed > 0 {
-		status = "Failure"
-		color = "Attention"
+	// Determine notification details based on status
+	var title, color string
+	switch status {
+	case "success":
+		title = "✅ GitHub Backup Successful"
+		color = "Good"
+	case "failure":
 		title = "❌ GitHub Backup Failed"
-		message = "Backup process failed"
-	} else if noChanges {
-		message = "No new backups needed (repositories unchanged)"
+		color = "Attention"
+	case "panic":
+		title = "💥 GitHub Backup Crashed"
+		color = "Attention"
+	default:
+		title = "⚠️ GitHub Backup Status"
+		color = "Warning"
 	}
-
-	// Build list of successful repositories
-	var successfulRepos []string
-	for _, result := range summary.Results {
-		if result.Success {
-			successfulRepos = append(successfulRepos, result.Repo)
-		}
-	}
-
+	
+	// Get workflow information
+	repo := os.Getenv("GITHUB_REPOSITORY")
+	runID := os.Getenv("GITHUB_RUN_ID")
+	serverURL := os.Getenv("GITHUB_SERVER_URL")
+	
 	// Create workflow URL
-	workflowURL := fmt.Sprintf("%s/%s/actions/runs/%s", 
-		os.Getenv("GITHUB_SERVER_URL"), 
-		os.Getenv("GITHUB_REPOSITORY"), 
-		os.Getenv("GITHUB_RUN_ID"))
-
+	workflowURL := ""
+	if repo != "" && runID != "" {
+		if serverURL == "" {
+			serverURL = "https://github.com"
+		}
+		workflowURL = fmt.Sprintf("%s/%s/actions/runs/%s", serverURL, repo, runID)
+	}
+	
+	// Build body elements
+	body := []map[string]interface{}{
+		{
+			"type":   "TextBlock",
+			"text":   title,
+			"weight": "Bolder",
+			"size":   "Large",
+			"color":  color,
+		},
+		{
+			"type": "TextBlock",
+			"text": fmt.Sprintf("%s on %s", message, time.Now().Format("2006-01-02")),
+			"wrap":  true,
+		},
+	}
+	
+	// Add workflow link if available
+	if workflowURL != "" {
+		body = append(body, map[string]interface{}{
+			"type": "TextBlock",
+			"text": fmt.Sprintf("[View Workflow](%s)", workflowURL),
+		})
+	}
+	
+	// Build facts section
+	facts := []map[string]string{
+		{"title": "Timestamp:", "value": time.Now().UTC().Format("2006-01-02T15:04:05Z")},
+		{"title": "Status:", "value": strings.Title(status)},
+	}
+	
+	if repo != "" {
+		facts = append(facts, map[string]string{"title": "Repository:", "value": repo})
+	}
+	
+	if runID != "" {
+		facts = append(facts, map[string]string{"title": "Workflow Run ID:", "value": runID})
+	}
+	
+	if len(successfulRepos) > 0 {
+		facts = append(facts, map[string]string{"title": "Successful Repos:", "value": strings.Join(successfulRepos, ", ")})
+	}
+	
+	// Add facts to body
+	body = append(body, map[string]interface{}{
+		"type": "FactSet",
+		"facts": facts,
+	})
+	
 	// Create webhook payload
 	payload := map[string]interface{}{
 		"type": "message",
@@ -542,39 +616,12 @@ func sendNotification(webhookURL string, summary Summary, noChanges bool) {
 					"$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
 					"type":    "AdaptiveCard",
 					"version": "1.3",
-					"body": []map[string]interface{}{
-						{
-							"type":   "TextBlock",
-							"text":   title,
-							"weight": "Bolder",
-							"size":   "Large",
-							"color":  color,
-						},
-						{
-							"type": "TextBlock",
-							"text": fmt.Sprintf("%s on %s", message, time.Now().Format("2006-01-02")),
-							"wrap":  true,
-						},
-						{
-							"type": "TextBlock",
-							"text": fmt.Sprintf("[View Workflow](%s)", workflowURL),
-						},
-						{
-							"type": "FactSet",
-							"facts": []map[string]string{
-								{"title": "Repository:", "value": os.Getenv("GITHUB_REPOSITORY")},
-								{"title": "Workflow Run ID:", "value": os.Getenv("GITHUB_RUN_ID")},
-								{"title": "Timestamp:", "value": time.Now().UTC().Format("2006-01-02T15:04:05Z")},
-								{"title": "Status:", "value": status},
-								{"title": "Successful Repos:", "value": strings.Join(successfulRepos, ", ")},
-							},
-						},
-					},
+					"body":    body,
 				},
 			},
 		},
 	}
-
+	
 	// Send webhook with timeout
 	client := &http.Client{Timeout: 30 * time.Second}
 	jsonData, err := json.Marshal(payload)
@@ -582,7 +629,7 @@ func sendNotification(webhookURL string, summary Summary, noChanges bool) {
 		log.Printf("Warning: failed to marshal webhook message: %v", err)
 		return
 	}
-
+	
 	resp, err := client.Post(webhookURL, "application/json", strings.NewReader(string(jsonData)))
 	if err != nil {
 		log.Printf("Warning: failed to send webhook: %v", err)
@@ -595,56 +642,54 @@ func sendNotification(webhookURL string, summary Summary, noChanges bool) {
 		return
 	}
 	
-	log.Printf("✅ Webhook notification sent successfully")
+	log.Printf("✅ Webhook notification sent successfully (%s)", status)
 }
 
 func printSummary(summary Summary) {
-	log.Printf("=== Backup Summary ===")
-	log.Printf("Date: %s", summary.Date)
-	log.Printf("Duration: %s", summary.Duration)
-	log.Printf("Success: %d, Failed: %d", summary.Success, summary.Failed)
+	log.Printf("\n📊 Backup Summary:")
+	log.Printf("   Total repositories: %d", summary.Total)
+	log.Printf("   Successful: %d", summary.Success)
+	log.Printf("   Failed: %d", summary.Failed)
+	log.Printf("   Duration: %v", summary.Duration)
 	
-	for _, result := range summary.Results {
-		if result.Success {
-			log.Printf("✅ %s: %s", result.Repo, result.Size)
-			if result.ZipSize != "" {
-				log.Printf("   📦 ZIP: %s", result.ZipSize)
+	if summary.Failed > 0 {
+		log.Printf("\n❌ Failed backups:")
+		for _, result := range summary.Results {
+			if !result.Success {
+				log.Printf("   - %s: %s", result.Repo, result.Error)
 			}
-			log.Printf("   ⏱️  Duration: %s", result.Duration)
-		} else {
-			log.Printf("❌ %s: %s", result.Repo, result.Error)
+		}
+	}
+	
+	if summary.Success > 0 {
+		log.Printf("\n✅ Successful backups:")
+		for _, result := range summary.Results {
+			if result.Success {
+				log.Printf("   - %s (%s -> %s)", result.Repo, byteCountDecimal(result.Size), byteCountDecimal(result.ZipSize))
+			}
 		}
 	}
 }
 
 func runCleanupChecks() {
-	log.Printf("ℹ️  Running cleanup checks...")
+	log.Println("ℹ️  Running cleanup checks...")
 	
 	// Check for backup results file
 	if _, err := os.Stat("backup-results.json"); err == nil {
-		log.Printf("ℹ️  Found backup results file")
+		log.Println("ℹ️  Found backup results file")
 	}
 	
-	// Check backup directory structure
+	// Check backup directory
 	if _, err := os.Stat("backups"); err == nil {
-		log.Printf("ℹ️  Backup directory exists")
-		log.Printf("ℹ️  Backup summary:")
+		log.Println("ℹ️  Backup directory exists")
 		
 		// Count ZIP files
-		zipCount := 0
-		filepath.Walk("backups", func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if !info.IsDir() && strings.HasSuffix(path, ".zip") {
-				zipCount++
-			}
-			return nil
-		})
-		
-		log.Printf("  - ZIP files: %d", zipCount)
+		zipFiles, err := filepath.Glob("backups/**/*.zip")
+		if err == nil {
+			log.Printf("  - ZIP files: %d", len(zipFiles))
+		}
 	} else {
-		log.Printf("⚠️  No backup directory found")
+		log.Println("⚠️  No backup directory found")
 	}
 	
 	log.Printf("✅ Cleanup checks completed")
