@@ -32,6 +32,9 @@ jobs:
               run: chmod +x scripts/backup-utils.sh
 
             - name: Validate environment variables
+              env:
+                  BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+                  GITHUB_REPOSITORY: ${{ github.repository }}
               run: ./scripts/backup-utils.sh validate
 
             - name: Run backup script
@@ -52,6 +55,9 @@ jobs:
 
             - name: Commit and push backups
               id: commit
+              env:
+                  BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+                  GITHUB_REPOSITORY: ${{ github.repository }}
               run: ./scripts/backup-utils.sh commit-push
 
             - name: Send final notification
@@ -77,5 +83,10 @@ jobs:
               with:
                   go-version: "1.21"
 
+            - name: Make utility script executable
+              run: chmod +x scripts/backup-utils.sh
+
             - name: Run cleanup checks
+              env:
+                  GITHUB_REPOSITORY: ${{ github.repository }}
               run: ./scripts/backup-utils.sh cleanup

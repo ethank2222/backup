@@ -53,10 +53,27 @@ type WebhookLogger struct {
 
 // LogMessage represents a structured log message for webhook
 type LogMessage struct {
-	Level     string                 `json:"level"`
-	Message   string                 `json:"message"`
-	Timestamp time.Time              `json:"timestamp"`
-	Fields    map[string]interface{} `json:"fields,omitempty"`
+	Type        string `json:"type"`
+	Attachments []struct {
+		ContentType string `json:"contentType"`
+		Content     struct {
+			Schema  string `json:"$schema"`
+			Type    string `json:"type"`
+			Version string `json:"version"`
+			Body    []struct {
+				Type string `json:"type"`
+				Text string `json:"text,omitempty"`
+				Weight string `json:"weight,omitempty"`
+				Size string `json:"size,omitempty"`
+				Color string `json:"color,omitempty"`
+				Wrap bool `json:"wrap,omitempty"`
+				Facts []struct {
+					Title string `json:"title"`
+					Value string `json:"value"`
+				} `json:"facts,omitempty"`
+			} `json:"body"`
+		} `json:"content"`
+	} `json:"attachments"`
 }
 
 // BackupManager handles the backup process
@@ -94,21 +111,113 @@ func (bm *BackupManager) Log(level slog.Level, msg string, fields ...interface{}
 
 	// Send to webhook if URL is provided
 	if bm.webhookLog.webhookURL != "" {
+		// Create adaptive card webhook message
 		webhookMsg := LogMessage{
-			Level:     level.String(),
-			Message:   msg,
-			Timestamp: time.Now(),
+			Type: "message",
+			Attachments: []struct {
+				ContentType string `json:"contentType"`
+				Content     struct {
+					Schema  string `json:"$schema"`
+					Type    string `json:"type"`
+					Version string `json:"version"`
+					Body    []struct {
+						Type string `json:"type"`
+						Text string `json:"text,omitempty"`
+						Weight string `json:"weight,omitempty"`
+						Size string `json:"size,omitempty"`
+						Color string `json:"color,omitempty"`
+						Wrap bool `json:"wrap,omitempty"`
+						Facts []struct {
+							Title string `json:"title"`
+							Value string `json:"value"`
+						} `json:"facts,omitempty"`
+					} `json:"body"`
+				} `json:"content"`
+			}{
+				{
+					ContentType: "application/vnd.microsoft.card.adaptive",
+					Content: struct {
+						Schema  string `json:"$schema"`
+						Type    string `json:"type"`
+						Version string `json:"version"`
+						Body    []struct {
+							Type string `json:"type"`
+							Text string `json:"text,omitempty"`
+							Weight string `json:"weight,omitempty"`
+							Size string `json:"size,omitempty"`
+							Color string `json:"color,omitempty"`
+							Wrap bool `json:"wrap,omitempty"`
+							Facts []struct {
+								Title string `json:"title"`
+								Value string `json:"value"`
+							} `json:"facts,omitempty"`
+						} `json:"body"`
+					}{
+						Schema:  "http://adaptivecards.io/schemas/adaptive-card.json",
+						Type:    "AdaptiveCard",
+						Version: "1.3",
+						Body: []struct {
+							Type string `json:"type"`
+							Text string `json:"text,omitempty"`
+							Weight string `json:"weight,omitempty"`
+							Size string `json:"size,omitempty"`
+							Color string `json:"color,omitempty"`
+							Wrap bool `json:"wrap,omitempty"`
+							Facts []struct {
+								Title string `json:"title"`
+								Value string `json:"value"`
+							} `json:"facts,omitempty"`
+						}{
+							{
+								Type:   "TextBlock",
+								Text:   msg,
+								Weight: "Bolder",
+								Size:   "Medium",
+								Color:  getColorForLevel(level),
+							},
+						},
+					},
+				},
+			},
 		}
 
-		// Convert fields to map
+		// Add fields as facts if present
 		if len(fields) > 0 {
-			webhookMsg.Fields = make(map[string]interface{})
+			facts := []struct {
+				Title string `json:"title"`
+				Value string `json:"value"`
+			}{}
+			
 			for i := 0; i < len(fields); i += 2 {
 				if i+1 < len(fields) {
 					if key, ok := fields[i].(string); ok {
-						webhookMsg.Fields[key] = fields[i+1]
+						facts = append(facts, struct {
+							Title string `json:"title"`
+							Value string `json:"value"`
+						}{
+							Title: key,
+							Value: fmt.Sprintf("%v", fields[i+1]),
+						})
 					}
 				}
+			}
+			
+			if len(facts) > 0 {
+				webhookMsg.Attachments[0].Content.Body = append(webhookMsg.Attachments[0].Content.Body, struct {
+					Type string `json:"type"`
+					Text string `json:"text,omitempty"`
+					Weight string `json:"weight,omitempty"`
+					Size string `json:"size,omitempty"`
+					Color string `json:"color,omitempty"`
+					Wrap bool `json:"wrap,omitempty"`
+					Facts []struct {
+						Title string `json:"title"`
+						Value string `json:"value"`
+					} `json:"facts,omitempty"`
+				}{
+					Type:  "FactSet",
+					Facts: facts,
+				})
 			}
 		}
 
@@ -138,7 +247,8 @@ func main() {
 	// Get required environment variables
 	backupToken := os.Getenv("BACKUP_TOKEN")
 	if backupToken == "" {
-		log.Fatal("BACKUP_TOKEN environment variable is required")
+		fmt.Fprintf(os.Stderr, "BACKUP_TOKEN environment variable is required\n")
+		os.Exit(1)
 	}
 
 	webhookURL := os.Getenv("WEBHOOK_URL")
@@ -637,4 +747,18 @@ func (bm *BackupManager) byteCountDecimal(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "kMGTPE"[exp])
-} 
+}
+
+// getColorForLevel returns the appropriate color for a log level
+func getColorForLevel(level slog.Level) string {
+	switch level {
+	case slog.LevelError:
+		return "Attention"
+	case slog.LevelWarn:
+		return "Warning"
+	case slog.LevelInfo:
+		return "Good"
+	default:
+		return "Default"
+	}
+}

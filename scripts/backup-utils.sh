@@ -159,15 +159,60 @@ send_webhook_notification() {
     if [ -n "$webhook_url" ]; then
         log_info "Sending webhook notification..."
         
+        # Create the webhook payload according to the specified schema
         local payload=$(cat <<EOF
 {
-  "title": "$title",
-  "text": "$message on $(date +%Y-%m-%d) - [View workflow](${GITHUB_SERVER_URL:-https://github.com}/$repository/actions/runs/$workflow_run_id)",
-  "results": $results,
-  "workflow_run_id": "$workflow_run_id",
-  "repository": "$repository",
-  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "job_status": "$job_status"
+  "type": "message",
+  "attachments": [
+    {
+      "contentType": "application/vnd.microsoft.card.adaptive",
+      "content": {
+        "\$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.3",
+        "body": [
+          {
+            "type": "TextBlock",
+            "text": "$title",
+            "weight": "Bolder",
+            "size": "Large",
+            "color": "$(if [ "$job_status" = "success" ]; then echo "Good"; elif [ "$job_status" = "failure" ]; then echo "Attention"; else echo "Default"; fi)"
+          },
+          {
+            "type": "TextBlock",
+            "text": "$message on $(date +%Y-%m-%d)",
+            "wrap": true
+          },
+          {
+            "type": "TextBlock",
+            "text": "[View Workflow](${GITHUB_SERVER_URL:-https://github.com}/$repository/actions/runs/$workflow_run_id)",
+            "type": "TextBlock"
+          },
+          {
+            "type": "FactSet",
+            "facts": [
+              {
+                "title": "Repository:",
+                "value": "$repository"
+              },
+              {
+                "title": "Workflow Run ID:",
+                "value": "$workflow_run_id"
+              },
+              {
+                "title": "Timestamp:",
+                "value": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              },
+              {
+                "title": "Status:",
+                "value": "$job_status"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
 }
 EOF
 )
