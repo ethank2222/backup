@@ -106,11 +106,32 @@ func NewBackupManager(backupToken, webhookURL string) *BackupManager {
 
 // Log sends a structured log message and optionally to webhook
 func (bm *BackupManager) Log(level slog.Level, msg string, fields ...interface{}) {
-	// Log to stdout
-	if len(fields) > 0 {
-		bm.logger.Log(level, msg, fields...)
-	} else {
-		bm.logger.Log(level, msg)
+	// Log to stdout using slog's built-in methods
+	switch level {
+	case slog.LevelError:
+		if len(fields) > 0 {
+			bm.logger.Error(msg, fields...)
+		} else {
+			bm.logger.Error(msg)
+		}
+	case slog.LevelWarn:
+		if len(fields) > 0 {
+			bm.logger.Warn(msg, fields...)
+		} else {
+			bm.logger.Warn(msg)
+		}
+	case slog.LevelInfo:
+		if len(fields) > 0 {
+			bm.logger.Info(msg, fields...)
+		} else {
+			bm.logger.Info(msg)
+		}
+	default:
+		if len(fields) > 0 {
+			bm.logger.Debug(msg, fields...)
+		} else {
+			bm.logger.Debug(msg)
+		}
 	}
 
 	// Send to webhook if URL is provided
