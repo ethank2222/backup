@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -64,6 +65,9 @@ func main() {
 
 	// Perform backups
 	summary := performBackups(repositories, backupToken, backupDate)
+
+	// Enforce retention: keep only 5 most recent backups per repo
+	enforceRetention(repositories)
 
 	// Create summary
 	createBackupSummary(summary, backupDate)
@@ -352,4 +356,51 @@ func appendToLog(logFile, message string) {
 	defer f.Close()
 	
 	f.WriteString(message)
+} 
+
+// enforceRetention keeps only the 5 most recent backup folders per repo, deleting the oldest.
+func enforceRetention(repositories []RepositoryConfig) {
+	const maxBackups = 5
+	for _, repo := range repositories {
+		repoPath := filepath.Join("backups", repo.Name)
+		entries, err := os.ReadDir(repoPath)
+		if err != nil {
+			continue // skip if can't read dir
+		}
+		var backupDirs []string
+		for _, entry := range entries {
+			if entry.IsDir() && isDateDir(entry.Name()) {
+				backupDirs = append(backupDirs, entry.Name())
+			}
+		}
+		if len(backupDirs) <= maxBackups {
+			continue
+		}
+		// Sort oldest to newest
+		sort.Strings(backupDirs)
+		toDelete := backupDirs[:len(backupDirs)-maxBackups]
+		for _, dir := range toDelete {
+			os.RemoveAll(filepath.Join(repoPath, dir))
+		}
+	}
+}
+
+// isDateDir returns true if the directory name looks like a date (YYYY-MM-DD)
+func isDateDir(name string) bool {
+	if len(name) != 10 {
+		return false
+	}
+	for i, c := range name {
+		switch i {
+		case 4, 7:
+			if c != '-' {
+				return false
+			}
+		default:
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
 } 

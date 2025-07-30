@@ -192,6 +192,11 @@ make docker-run
 - **Directory Management**: Existing backups are safely replaced
 - **Error Reporting**: Clear error messages for debugging
 
+## 🗓️ Daily Backup Logic
+
+- If a backup for today already exists, it is **deleted before the new backup is taken**. This ensures you always have only the latest backup for each day, and never duplicate backups for the same date.
+- The system will automatically keep only the 5 most recent daily backups per repository, deleting the oldest ones.
+
 ## 🚀 GitHub Actions Integration
 
 The system integrates seamlessly with GitHub Actions. The workflow at `.github/workflows/daily-backup.yml`:
