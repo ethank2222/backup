@@ -1,112 +1,130 @@
-# Makefile for Backup System
+# Bare-bones Production Makefile for GitHub Repository Backup Tool
 
 # Variables
-BINARY_NAME=backup
-BUILD_DIR=build
+APP_NAME := backup
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+BUILD_DIR := build
 
-# Go variables
-GOCMD=go
-GOBUILD=$(GOCMD) build
-GOCLEAN=$(GOCMD) clean
-GOTEST=$(GOCMD) test
-GOGET=$(GOCMD) get
-GOMOD=$(GOCMD) mod
-GORUN=$(GOCMD) run
+# Go settings
+GOCMD := go
+GOBUILD := $(GOCMD) build
+GOCLEAN := $(GOCMD) clean
+GOTEST := $(GOCMD) test
+GORUN := $(GOCMD) run
 
 # Build flags
-LDFLAGS=-ldflags "-X main.Version=$(shell git describe --tags --always --dirty) -X main.BuildTime=$(shell date -u '+%Y-%m-%d_%H:%M:%S')"
+LDFLAGS := -ldflags "-X main.Version=$(VERSION) -s -w"
 
 # Default target
 .DEFAULT_GOAL := help
 
 .PHONY: help
 help: ## Show this help message
-	@echo "Backup System - Available commands:"
+	@echo "GitHub Repository Backup Tool - Available commands:"
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
 build: ## Build the backup binary
-	@echo "Building backup binary..."
+	@echo "Building $(APP_NAME)..."
 	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) .
+	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(APP_NAME) backup.go
+	@echo "✅ Build complete: $(BUILD_DIR)/$(APP_NAME)"
+
+.PHONY: build-all
+build-all: ## Build for all platforms
+	@echo "Building for all platforms..."
+	@mkdir -p $(BUILD_DIR)
+	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(APP_NAME)-linux backup.go
+	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(APP_NAME)-windows.exe backup.go
+	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(APP_NAME)-darwin backup.go
+	@echo "✅ Cross-platform builds complete"
 
 .PHONY: clean
 clean: ## Clean build artifacts
 	@echo "Cleaning build artifacts..."
 	$(GOCLEAN)
 	@rm -rf $(BUILD_DIR)
+	@echo "✅ Clean complete"
 
 .PHONY: test
 test: ## Run tests
 	@echo "Running tests..."
 	$(GOTEST) -v ./...
-
-.PHONY: test-coverage
-test-coverage: ## Run tests with coverage
-	@echo "Running tests with coverage..."
-	@mkdir -p coverage
-	$(GOTEST) -coverprofile=coverage/coverage.out ./...
-	$(GOCMD) tool cover -html=coverage/coverage.out -o coverage/coverage.html
-	@echo "Coverage report generated: coverage/coverage.html"
+	@echo "✅ Tests complete"
 
 .PHONY: run
 run: ## Run the backup system
 	@echo "Running backup system..."
+	@if [ -z "$(BACKUP_TOKEN)" ]; then \
+		echo "⚠️  Warning: BACKUP_TOKEN not set"; \
+	fi
 	$(GORUN) backup.go
 
-.PHONY: install
-install: ## Install dependencies
-	@echo "Installing dependencies..."
-	$(GOMOD) download
-	$(GOMOD) tidy
+.PHONY: validate
+validate: ## Validate configuration and environment
+	@echo "Validating configuration..."
+	@if [ ! -f repositories.txt ]; then \
+		echo "❌ Error: repositories.txt not found"; \
+		exit 1; \
+	fi
+	@if [ -z "$(BACKUP_TOKEN)" ]; then \
+		echo "❌ Error: BACKUP_TOKEN not set"; \
+		exit 1; \
+	fi
+	@if [ -z "$(GITHUB_REPOSITORY)" ]; then \
+		echo "❌ Error: GITHUB_REPOSITORY not set"; \
+		exit 1; \
+	fi
+	@echo "✅ Configuration validated"
 
 .PHONY: fmt
 fmt: ## Format code
 	@echo "Formatting code..."
 	$(GOCMD) fmt ./...
+	@echo "✅ Code formatted"
 
 .PHONY: vet
 vet: ## Vet code
 	@echo "Vetting code..."
 	$(GOCMD) vet ./...
+	@echo "✅ Code vetted"
 
 .PHONY: check
 check: fmt vet test ## Run all code quality checks
 
-.PHONY: validate-config
-validate-config: ## Validate configuration file
-	@echo "Validating configuration..."
-	@if [ -f repositories.txt ]; then \
-		echo "Repositories file exists"; \
-		echo "Repositories to backup:"; \
-		grep -v '^#' repositories.txt | grep -v '^$$' || echo "No repositories found"; \
-	else \
-		echo "Error: repositories.txt not found - this file is required"; \
-		exit 1; \
-	fi
-
 .PHONY: docker-build
 docker-build: ## Build Docker image
 	@echo "Building Docker image..."
-	docker build -t backup-system .
+	docker build -t github-backup:latest .
+	@echo "✅ Docker image built"
 
 .PHONY: docker-run
 docker-run: ## Run Docker container
 	@echo "Running Docker container..."
-	docker run --rm -e BACKUP_TOKEN=your-token-here backup-system
+	@if [ -z "$(BACKUP_TOKEN)" ]; then \
+		echo "❌ Error: BACKUP_TOKEN not set"; \
+		exit 1; \
+	fi
+	docker run --rm \
+		-e BACKUP_TOKEN=$(BACKUP_TOKEN) \
+		-e GITHUB_REPOSITORY=$(GITHUB_REPOSITORY) \
+		-e WEBHOOK_URL=$(WEBHOOK_URL) \
+		github-backup:latest
 
 .PHONY: release
-release: clean build test ## Create release build
-	@echo "Creating release..."
+release: clean build-all ## Create release package
+	@echo "Creating release package..."
 	@mkdir -p release
 	@cp $(BUILD_DIR)/* release/
-	@cp repositories.txt release/
-	@cp README-backup.md release/
-	@echo "Release files created in release/ directory"
+	@cp repositories.txt release/ 2>/dev/null || echo "⚠️  repositories.txt not found"
+	@cp README.md release/
+	@echo "✅ Release files created in release/"
 
-.PHONY: dev
-dev: install check run ## Development workflow
+.PHONY: production
+production: validate check build ## Production build with validation
+	@echo "✅ Production build complete"
 
-.PHONY: verify
-verify: check build ## Run all verification steps 
+.PHONY: quick
+quick: build run ## Quick build and run
+	@echo "✅ Quick build and run complete" 
