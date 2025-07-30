@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"archive/zip"
+	"io"
 )
 
 // RepositoryConfig defines a repository to backup
@@ -24,6 +26,7 @@ type BackupResult struct {
 	Success   bool          `json:"success"`
 	Error     string        `json:"error,omitempty"`
 	Size      string        `json:"size"`
+	ZipSize   string        `json:"zip_size,omitempty"`
 	Duration  time.Duration `json:"duration"`
 	StartTime time.Time     `json:"start_time"`
 	EndTime   time.Time     `json:"end_time"`
@@ -183,7 +186,8 @@ func performBackups(repositories []RepositoryConfig, backupToken, backupDate str
 
 		// Clone repository with retry
 		backupPath := filepath.Join("backups", repo.Name, backupDate, repo.Name+".git")
-		
+		zipPath := backupPath + ".zip"
+
 		// Construct authenticated URL
 		repoURL := repo.URL
 		if strings.HasPrefix(repoURL, "https://") {
@@ -191,11 +195,11 @@ func performBackups(repositories []RepositoryConfig, backupToken, backupDate str
 		} else if strings.HasPrefix(repoURL, "git@") {
 			repoURL = strings.Replace(repoURL, "git@github.com:", fmt.Sprintf("https://%s@github.com/", backupToken), 1)
 		}
-		
+
 		// Retry logic
 		maxRetries := 3
 		var lastError error
-		
+
 		for attempt := 1; attempt <= maxRetries; attempt++ {
 			if err := cloneRepository(repoURL, backupPath); err != nil {
 				lastError = err
@@ -224,8 +228,19 @@ func performBackups(repositories []RepositoryConfig, backupToken, backupDate str
 				result.Size = size
 			}
 
+			// Compress to zip
+			if err := zipDirectory(backupPath, zipPath); err == nil {
+				if zipSize, err := getFileSize(zipPath); err == nil {
+					result.ZipSize = zipSize
+				}
+				// Delete the uncompressed .git folder
+				os.RemoveAll(backupPath)
+			} else {
+				log.Printf("Warning: Could not compress backup for %s: %v", repo.Name, err)
+			}
+
 			// Log success
-			logMessage := fmt.Sprintf("✅ %s mirrored successfully - %s\n", repo.Name, time.Now().Format("2006-01-02 15:04:05"))
+			logMessage := fmt.Sprintf("✅ %s mirrored and zipped successfully - %s\n", repo.Name, time.Now().Format("2006-01-02 15:04:05"))
 			appendToLog("backup-log.txt", logMessage)
 		}
 
@@ -234,7 +249,7 @@ func performBackups(repositories []RepositoryConfig, backupToken, backupDate str
 
 		if result.Success {
 			summary.SuccessCount++
-			log.Printf("✅ %s backed up successfully (%s) in %s", repo.Name, result.Size, result.Duration)
+			log.Printf("✅ %s backed up and zipped successfully (%s) in %s", repo.Name, result.ZipSize, result.Duration)
 		} else {
 			summary.FailureCount++
 			log.Printf("❌ %s backup failed: %s", repo.Name, result.Error)
@@ -323,7 +338,11 @@ func createMarkdownSummary(path string, summary BackupSummary) {
 	content.WriteString("## Backup Results:\n")
 	for _, result := range summary.Results {
 		if result.Success {
-			content.WriteString(fmt.Sprintf("- ✅ **%s**: %s - %s\n", result.Name, result.Size, result.Duration.String()))
+			content.WriteString(fmt.Sprintf("- ✅ **%s**: %s", result.Name, result.Size))
+			if result.ZipSize != "" {
+				content.WriteString(fmt.Sprintf(" (zip: %s)", result.ZipSize))
+			}
+			content.WriteString(fmt.Sprintf(" - %s\n", result.Duration.String()))
 		} else {
 			content.WriteString(fmt.Sprintf("- ❌ **%s**: %s\n", result.Name, result.Error))
 		}
@@ -403,4 +422,80 @@ func isDateDir(name string) bool {
 		}
 	}
 	return true
+} 
+
+// zipDirectory compresses the given directory into a zip file at zipPath
+func zipDirectory(srcDir, zipPath string) error {
+	zipFile, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer zipFile.Close()
+
+	zipWriter := zip.NewWriter(zipFile)
+	defer zipWriter.Close()
+
+	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		relPath, err := filepath.Rel(filepath.Dir(srcDir), path)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if path == srcDir {
+				return nil // don't add the root dir itself
+			}
+			// Add directory entry
+			header := &zip.FileHeader{
+				Name:     relPath + "/",
+				Method:   zip.Deflate,
+				Modified: info.ModTime(),
+			}
+			_, err := zipWriter.CreateHeader(header)
+			return err
+		}
+		// Add file entry
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = relPath
+		header.Method = zip.Deflate
+		writer, err := zipWriter.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(writer, file)
+		return err
+	})
+}
+
+// getFileSize returns the size of the file at path as a human-readable string
+func getFileSize(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	return byteCountDecimal(info.Size()), nil
+}
+
+// byteCountDecimal returns a human-readable file size
+func byteCountDecimal(b int64) string {
+	const unit = 1000
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "kMGTPE"[exp])
 } 
