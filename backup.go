@@ -104,7 +104,7 @@ func NewBackupManager(backupToken, webhookURL string) *BackupManager {
 	}
 }
 
-// Log sends a structured log message and optionally to webhook
+// Log sends a structured log message to stdout only
 func (bm *BackupManager) Log(level slog.Level, msg string, fields ...interface{}) {
 	// Log to stdout using slog's built-in methods
 	switch level {
@@ -133,121 +133,6 @@ func (bm *BackupManager) Log(level slog.Level, msg string, fields ...interface{}
 			bm.logger.Debug(msg)
 		}
 	}
-
-	// Send to webhook if URL is provided
-	if bm.webhookLog.webhookURL != "" {
-		// Create adaptive card webhook message
-		webhookMsg := LogMessage{
-			Type: "message",
-			Attachments: []struct {
-				ContentType string `json:"contentType"`
-				Content     struct {
-					Schema  string `json:"$schema"`
-					Type    string `json:"type"`
-					Version string `json:"version"`
-					Body    []struct {
-						Type string `json:"type"`
-						Text string `json:"text,omitempty"`
-						Weight string `json:"weight,omitempty"`
-						Size string `json:"size,omitempty"`
-						Color string `json:"color,omitempty"`
-						Wrap bool `json:"wrap,omitempty"`
-						Facts []struct {
-							Title string `json:"title"`
-							Value string `json:"value"`
-						} `json:"facts,omitempty"`
-					} `json:"body"`
-				} `json:"content"`
-			}{
-				{
-					ContentType: "application/vnd.microsoft.card.adaptive",
-					Content: struct {
-						Schema  string `json:"$schema"`
-						Type    string `json:"type"`
-						Version string `json:"version"`
-						Body    []struct {
-							Type string `json:"type"`
-							Text string `json:"text,omitempty"`
-							Weight string `json:"weight,omitempty"`
-							Size string `json:"size,omitempty"`
-							Color string `json:"color,omitempty"`
-							Wrap bool `json:"wrap,omitempty"`
-							Facts []struct {
-								Title string `json:"title"`
-								Value string `json:"value"`
-							} `json:"facts,omitempty"`
-						} `json:"body"`
-					}{
-						Schema:  "http://adaptivecards.io/schemas/adaptive-card.json",
-						Type:    "AdaptiveCard",
-						Version: "1.3",
-						Body: []struct {
-							Type string `json:"type"`
-							Text string `json:"text,omitempty"`
-							Weight string `json:"weight,omitempty"`
-							Size string `json:"size,omitempty"`
-							Color string `json:"color,omitempty"`
-							Wrap bool `json:"wrap,omitempty"`
-							Facts []struct {
-								Title string `json:"title"`
-								Value string `json:"value"`
-							} `json:"facts,omitempty"`
-						}{
-							{
-								Type:   "TextBlock",
-								Text:   msg,
-								Weight: "Bolder",
-								Size:   "Medium",
-								Color:  getColorForLevel(level),
-							},
-						},
-					},
-				},
-			},
-		}
-
-		// Add fields as facts if present
-		if len(fields) > 0 {
-			facts := []struct {
-				Title string `json:"title"`
-				Value string `json:"value"`
-			}{}
-			
-			for i := 0; i < len(fields); i += 2 {
-				if i+1 < len(fields) {
-					if key, ok := fields[i].(string); ok {
-						facts = append(facts, struct {
-							Title string `json:"title"`
-							Value string `json:"value"`
-						}{
-							Title: key,
-							Value: fmt.Sprintf("%v", fields[i+1]),
-						})
-					}
-				}
-			}
-			
-			if len(facts) > 0 {
-				webhookMsg.Attachments[0].Content.Body = append(webhookMsg.Attachments[0].Content.Body, struct {
-					Type string `json:"type"`
-					Text string `json:"text,omitempty"`
-					Weight string `json:"weight,omitempty"`
-					Size string `json:"size,omitempty"`
-					Color string `json:"color,omitempty"`
-					Wrap bool `json:"wrap,omitempty"`
-					Facts []struct {
-						Title string `json:"title"`
-						Value string `json:"value"`
-					} `json:"facts,omitempty"`
-				}{
-					Type:  "FactSet",
-					Facts: facts,
-				})
-			}
-		}
-
-		bm.webhookLog.Send(webhookMsg)
-	}
 }
 
 // Send sends a log message to the webhook
@@ -266,6 +151,129 @@ func (wl *WebhookLogger) Send(msg LogMessage) {
 		return
 	}
 	defer resp.Body.Close()
+}
+
+// SendFinalNotification sends a single, simplified webhook notification with backup results
+func (bm *BackupManager) SendFinalNotification(summary BackupSummary, workflowURL string) {
+	if bm.webhookLog.webhookURL == "" {
+		return
+	}
+
+	// Determine status and color
+	status := "Success"
+	color := "Good"
+	if summary.FailureCount > 0 {
+		status = "Failure"
+		color = "Attention"
+	}
+
+	// Build list of successful repositories
+	var successfulRepos []string
+	for _, result := range summary.Results {
+		if result.Success {
+			successfulRepos = append(successfulRepos, result.Name)
+		}
+	}
+
+	// Create simplified webhook message
+	webhookMsg := LogMessage{
+		Type: "message",
+		Attachments: []struct {
+			ContentType string `json:"contentType"`
+			Content     struct {
+				Schema  string `json:"$schema"`
+				Type    string `json:"type"`
+				Version string `json:"version"`
+				Body    []struct {
+					Type string `json:"type"`
+					Text string `json:"text,omitempty"`
+					Weight string `json:"weight,omitempty"`
+					Size string `json:"size,omitempty"`
+					Color string `json:"color,omitempty"`
+					Wrap bool `json:"wrap,omitempty"`
+					Facts []struct {
+						Title string `json:"title"`
+						Value string `json:"value"`
+					} `json:"facts,omitempty"`
+				} `json:"body"`
+			} `json:"content"`
+		}{
+			{
+				ContentType: "application/vnd.microsoft.card.adaptive",
+				Content: struct {
+					Schema  string `json:"$schema"`
+					Type    string `json:"type"`
+					Version string `json:"version"`
+					Body    []struct {
+						Type string `json:"type"`
+						Text string `json:"text,omitempty"`
+						Weight string `json:"weight,omitempty"`
+						Size string `json:"size,omitempty"`
+						Color string `json:"color,omitempty"`
+						Wrap bool `json:"wrap,omitempty"`
+						Facts []struct {
+							Title string `json:"title"`
+							Value string `json:"value"`
+						} `json:"facts,omitempty"`
+					} `json:"body"`
+				}{
+					Schema:  "http://adaptivecards.io/schemas/adaptive-card.json",
+					Type:    "AdaptiveCard",
+					Version: "1.3",
+					Body: []struct {
+						Type string `json:"type"`
+						Text string `json:"text,omitempty"`
+						Weight string `json:"weight,omitempty"`
+						Size string `json:"size,omitempty"`
+						Color string `json:"color,omitempty"`
+						Wrap bool `json:"wrap,omitempty"`
+						Facts []struct {
+							Title string `json:"title"`
+							Value string `json:"value"`
+						} `json:"facts,omitempty"`
+					}{
+						{
+							Type:   "TextBlock",
+							Text:   fmt.Sprintf("🔔 GitHub Backup %s", status),
+							Weight: "Bolder",
+							Size:   "Large",
+							Color:  color,
+						},
+						{
+							Type: "FactSet",
+							Facts: []struct {
+								Title string `json:"title"`
+								Value string `json:"value"`
+							}{
+								{
+									Title: "Date:",
+									Value: summary.Date,
+								},
+								{
+									Title: "Status:",
+									Value: status,
+								},
+								{
+									Title: "Timestamp:",
+									Value: summary.EndTime.Format("2006-01-02 15:04:05 UTC"),
+								},
+								{
+									Title: "Successful Repos:",
+									Value: strings.Join(successfulRepos, ", "),
+								},
+								{
+									Title: "Link:",
+									Value: workflowURL,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	bm.webhookLog.Send(webhookMsg)
 }
 
 func main() {
@@ -322,6 +330,13 @@ func (bm *BackupManager) RunBackup() error {
 		"failure_count", summary.FailureCount,
 		"duration", summary.Duration.String(),
 		"success_rate", fmt.Sprintf("%.1f%%", float64(summary.SuccessCount)/float64(len(summary.Results))*100))
+
+	// Send single webhook notification with results
+	workflowURL := fmt.Sprintf("%s/%s/actions/runs/%s", 
+		os.Getenv("GITHUB_SERVER_URL"), 
+		os.Getenv("GITHUB_REPOSITORY"), 
+		os.Getenv("GITHUB_RUN_ID"))
+	bm.SendFinalNotification(summary, workflowURL)
 
 	return nil
 }
