@@ -1,0 +1,37 @@
+{
+  "date": "2025-07-30",
+  "start_time": "2025-07-30T16:24:07.009413625Z",
+  "end_time": "2025-07-30T16:24:13.290135699Z",
+  "duration": 6280722084,
+  "results": [
+    {
+      "name": "TrinityAI",
+      "success": true,
+      "size": "288K",
+      "zip_size": "179.6 kB",
+      "duration": 228095182,
+      "start_time": "2025-07-30T16:24:07.153843405Z",
+      "end_time": "2025-07-30T16:24:07.381938557Z"
+    },
+    {
+      "name": "TriniTeam",
+      "success": true,
+      "size": "288K",
+      "zip_size": "180.1 kB",
+      "duration": 214600079,
+      "start_time": "2025-07-30T16:24:07.680145793Z",
+      "end_time": "2025-07-30T16:24:07.894745883Z"
+    },
+    {
+      "name": "PageAI",
+      "success": true,
+      "size": "8.0M",
+      "zip_size": "8.3 MB",
+      "duration": 618397355,
+      "start_time": "2025-07-30T16:24:12.520713063Z",
+      "end_time": "2025-07-30T16:24:13.139110458Z"
+    }
+  ],
+  "success_count": 3,
+  "failure_count": 0
+}
