@@ -1,160 +1,125 @@
 name: Daily Repository Backup
 on:
-    schedule:
-        - cron: "0 2 * * *" # Run daily at 2 AM UTC (fixed: was missing last *)
-    workflow_dispatch: # Allow manual triggering
+  schedule:
+    - cron: "0 2 * * *" # Run daily at 2 AM UTC
+  workflow_dispatch: # Allow manual triggering
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
-    backup:
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout backup repository
-              uses: actions/checkout@v4
-              with:
-                  token: ${{ secrets.BACKUP_TOKEN }}
-                  fetch-depth: 0
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-            - name: Setup Git user
-              run: |
-                  git config --global user.name "Backup Bot"
-                  git config --global user.email "ethank2222@gmail.com"
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.21"
 
-            - name: Set backup date
-              id: set_date
-              run: |
-                  BACKUP_DATE=$(date +%Y-%m-%d)
-                  echo "BACKUP_DATE=$BACKUP_DATE" >> $GITHUB_ENV
-                  echo "Backup date set to: $BACKUP_DATE"
+      - name: Install dependencies
+        run: go mod download
 
-            - name: Create backup directories
-              run: |
-                  # Remove existing backup for today if it exists
-                  rm -rf backups/TrinityAI/${{ env.BACKUP_DATE }}
-                  rm -rf backups/TriniTeam/${{ env.BACKUP_DATE }}
-                  rm -rf backups/PageAI/${{ env.BACKUP_DATE }}
+      - name: Run tests
+        run: go test -v ./...
 
-                  # Create fresh backup directories
-                  mkdir -p backups/TrinityAI/${{ env.BACKUP_DATE }}
-                  mkdir -p backups/TriniTeam/${{ env.BACKUP_DATE }}
-                  mkdir -p backups/PageAI/${{ env.BACKUP_DATE }}
-                  echo "Backup directories created (replaced existing if any)" > backup-log.txt
+      - name: Run tests with coverage
+        run: |
+          mkdir -p coverage
+          go test -coverprofile=coverage/coverage.out ./...
+          go tool cover -html=coverage/coverage.out -o coverage/coverage.html
 
-            - name: Backup TrinityAI mirror (all branches)
-              run: |
-                  echo "Starting backup of TrinityAI..."
-                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/TrinityAI.git backups/TrinityAI/${{ env.BACKUP_DATE }}/TrinityAI.git
-                  # Remove credentials from config to prevent secrets in backup
-                  sed -i 's|https://.*@github.com|https://github.com|g' backups/TrinityAI/${{ env.BACKUP_DATE }}/TrinityAI.git/config
-                  echo "✅ TrinityAI mirrored successfully - $(date)" >> backup-log.txt
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/coverage.out
+          flags: unittests
+          name: codecov-umbrella
 
-            - name: Backup TriniTeam mirror (all branches)
-              run: |
-                  echo "Starting backup of TriniTeam..."
-                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/TriniTeam.git backups/TriniTeam/${{ env.BACKUP_DATE }}/TriniTeam.git
-                  # Remove credentials from config to prevent secrets in backup
-                  sed -i 's|https://.*@github.com|https://github.com|g' backups/TriniTeam/${{ env.BACKUP_DATE }}/TriniTeam.git/config
-                  echo "✅ TriniTeam mirrored successfully - $(date)" >> backup-log.txt
+      - name: Run security scan
+        run: |
+          if command -v gosec >/dev/null 2>&1; then
+            gosec ./...
+          else
+            echo "gosec not available, skipping security scan"
+          fi
 
-            - name: Backup PageAI mirror (all branches)
-              run: |
-                  echo "Starting backup of PageAI..."
-                  git clone --mirror https://${{ secrets.BACKUP_TOKEN }}@github.com/ethank2222/PageAI.git backups/PageAI/${{ env.BACKUP_DATE }}/PageAI.git
-                  # Remove credentials from config to prevent secrets in backup
-                  sed -i 's|https://.*@github.com|https://github.com|g' backups/PageAI/${{ env.BACKUP_DATE }}/PageAI.git/config
-                  echo "✅ PageAI mirrored successfully - $(date)" >> backup-log.txt
+  backup:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout backup repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BACKUP_TOKEN }}
+          fetch-depth: 0
 
-            - name: Create backup summary
-              run: |
-                  SUMMARY_DIR=backups/summary/${{ env.BACKUP_DATE }}
-                  mkdir -p "$SUMMARY_DIR"
-                  echo "# Backup Summary - ${{ env.BACKUP_DATE }}" > "$SUMMARY_DIR/README.md"
-                  echo "" >> "$SUMMARY_DIR/README.md"
-                  echo "Backup completed at: $(date)" >> "$SUMMARY_DIR/README.md"
-                  echo "Repositories backed up:" >> "$SUMMARY_DIR/README.md"
-                  echo "- TrinityAI" >> "$SUMMARY_DIR/README.md"
-                  echo "- TriniTeam" >> "$SUMMARY_DIR/README.md"
-                  echo "- PageAI" >> "$SUMMARY_DIR/README.md"
-                  echo "" >> "$SUMMARY_DIR/README.md"
-                  echo "## Backup Log:" >> "$SUMMARY_DIR/README.md"
-                  cat backup-log.txt >> "$SUMMARY_DIR/README.md"
+      - name: Setup Git user
+        run: |
+          git config --global user.name "Backup Bot"
+          git config --global user.email "ethank2222@gmail.com"
 
-            - name: Calculate backup sizes
-              run: |
-                  echo "" >> backup-log.txt
-                  echo "Backup sizes:" >> backup-log.txt
-                  for REPO in TrinityAI TriniTeam PageAI; do
-                    if [ -d "backups/$REPO/${{ env.BACKUP_DATE }}" ]; then
-                      SIZE=$(du -sh "backups/$REPO/${{ env.BACKUP_DATE }}" | cut -f1)
-                      echo "- $REPO: $SIZE" >> backup-log.txt
-                    fi
-                  done
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.21"
 
-            - name: Cleanup old backups (keep last 5 backups per repo)
-              run: |
-                  cd backups
-                  CLEANED_COUNT=0
-                  for REPO in TrinityAI TriniTeam PageAI; do
-                    if [ -d "$REPO" ]; then
-                      cd "$REPO"
-                      # Get sorted list of backup directories (newest first)
-                      BACKUPS=($(ls -1d 20* 2>/dev/null | sort -r || true))
-                      COUNT=${#BACKUPS[@]}
-                      if [ $COUNT -gt 5 ]; then
-                        # Keep the 5 newest backups, delete the rest
-                        TO_DELETE=(${BACKUPS[@]:5})
-                        for OLD in "${TO_DELETE[@]}"; do
-                          echo "Deleting old backup: $REPO/$OLD"
-                          rm -rf "$OLD"
-                          CLEANED_COUNT=$((CLEANED_COUNT + 1))
-                        done
-                      fi
-                      cd ..
-                    fi
-                  done
-                  echo "Cleaned up $CLEANED_COUNT old backup directories" >> ../backup-log.txt
+      - name: Install dependencies
+        run: go mod download
 
-            - name: Commit and push backups
-              run: |
-                  git add .
-                  if git diff --staged --quiet; then
-                    echo "No changes to commit"
-                    echo "NO_CHANGES=true" >> $GITHUB_ENV
-                  else
-                    git commit -m "Daily mirror backup - ${{ env.BACKUP_DATE }}"
-                    git push origin main
-                    echo "BACKUP_COMMITTED=true" >> $GITHUB_ENV
-                  fi
+      - name: Run backup script
+        env:
+          BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          go run backup.go
 
-            - name: Send success notification
-              if: success()
-              run: |
-                  # Count total repositories backed up
-                  REPO_COUNT=$(grep -c "mirrored successfully" backup-log.txt || echo "0")
+      - name: Commit and push backups
+        id: commit
+        run: |
+          git add .
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            echo "NO_CHANGES=true" >> $GITHUB_ENV
+          else
+            git commit -m "Daily mirror backup - $(date +%Y-%m-%d)"
+            git push origin main
+            echo "BACKUP_COMMITTED=true" >> $GITHUB_ENV
+          fi
 
-                  # Determine if new backups were created
-                  if [ "${{ env.NO_CHANGES }}" = "true" ]; then
-                    STATUS_MESSAGE="No new backups needed (repositories unchanged)"
-                  else
-                    STATUS_MESSAGE="$REPO_COUNT repositories backed up successfully"
-                  fi
+      - name: Send success notification
+        if: success()
+        run: |
+          # Count total repositories backed up
+          REPO_COUNT=$(grep -c "mirrored successfully" backup-log.txt || echo "0")
 
-                  curl -H 'Content-Type: application/x-www-form-urlencoded' \
-                    -d "title=✅ GitHub Backup Successful" \
-                    -d "text=Backup successful on ${{ env.BACKUP_DATE }} - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
-                    "${{ secrets.WEBHOOK_URL }}"
+          # Determine if new backups were created
+          if [ "${{ env.NO_CHANGES }}" = "true" ]; then
+            STATUS_MESSAGE="No new backups needed (repositories unchanged)"
+          else
+            STATUS_MESSAGE="$REPO_COUNT repositories backed up successfully"
+          fi
 
-            - name: Send failure notification
-              if: failure()
-              run: |
-                  curl -H 'Content-Type: application/x-www-form-urlencoded' \
-                    -d "title=❌ GitHub Backup Failed" \
-                    -d "text=Backup failed on ${{ env.BACKUP_DATE }} - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
-                    "${{ secrets.WEBHOOK_URL }}"
+          curl -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d "title=✅ GitHub Backup Successful" \
+            -d "text=Backup successful on $(date +%Y-%m-%d) - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+            "${{ secrets.WEBHOOK_URL }}"
 
-            - name: Send notification on cancellation
-              if: cancelled()
-              run: |
-                  curl -H 'Content-Type: application/x-www-form-urlencoded' \
-                    -d "title=⚠️ GitHub Backup Cancelled" \
-                    -d "text=Backup cancelled on ${{ env.BACKUP_DATE }} - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
-                    "${{ secrets.WEBHOOK_URL }}"
+      - name: Send failure notification
+        if: failure()
+        run: |
+          curl -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d "title=❌ GitHub Backup Failed" \
+            -d "text=Backup failed on $(date +%Y-%m-%d) - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+            "${{ secrets.WEBHOOK_URL }}"
+
+      - name: Send notification on cancellation
+        if: cancelled()
+        run: |
+          curl -H 'Content-Type: application/x-www-form-urlencoded' \
+            -d "title=⚠️ GitHub Backup Cancelled" \
+            -d "text=Backup cancelled on $(date +%Y-%m-%d) - [View workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" \
+            "${{ secrets.WEBHOOK_URL }}"
