@@ -9,24 +9,24 @@
       "Error": "",
       "Size": 191753,
       "ZipSize": 178915,
-      "Duration": 233695294
+      "Duration": 518562655
     },
     {
       "Repo": "https://github.com/ethank2222/TriniTeam.git",
       "Success": true,
       "Error": "",
       "Size": 190380,
-      "ZipSize": 179415,
-      "Duration": 202307312
+      "ZipSize": 179417,
+      "Duration": 493974910
     },
     {
       "Repo": "https://github.com/ethank2222/PageAI.git",
       "Success": true,
       "Error": "",
       "Size": 8281584,
-      "ZipSize": 8267634,
-      "Duration": 603899607
+      "ZipSize": 8267636,
+      "Duration": 932442471
     }
   ],
-  "Duration": 1040307484
+  "Duration": 1945255811
 }
