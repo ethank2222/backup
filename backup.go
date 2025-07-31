@@ -688,9 +688,83 @@ func runCleanupChecks() {
 		if err == nil {
 			log.Printf("  - ZIP files: %d", len(zipFiles))
 		}
+		
+		// Clean up old backups (keep only last 5)
+		if err := cleanupOldBackups(); err != nil {
+			log.Printf("Warning: Failed to cleanup old backups: %v", err)
+		}
 	} else {
 		log.Println("⚠️  No backup directory found")
 	}
 	
 	log.Printf("✅ Cleanup checks completed")
+}
+
+func cleanupOldBackups() error {
+	// Find all backup directories
+	backupDirs, err := filepath.Glob("backups/*/*")
+	if err != nil {
+		return fmt.Errorf("failed to find backup directories: %v", err)
+	}
+	
+	for _, dir := range backupDirs {
+		// Check if it's a directory
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		
+		// Find all ZIP files in this directory
+		zipFiles, err := filepath.Glob(filepath.Join(dir, "*.zip"))
+		if err != nil {
+			log.Printf("Warning: Failed to find ZIP files in %s: %v", dir, err)
+			continue
+		}
+		
+		// If we have more than 5 backups, remove the oldest ones
+		if len(zipFiles) > 5 {
+			// Sort files by modification time (oldest first)
+			type fileInfo struct {
+				path    string
+				modTime time.Time
+			}
+			
+			var files []fileInfo
+			for _, file := range zipFiles {
+				info, err := os.Stat(file)
+				if err != nil {
+					log.Printf("Warning: Failed to stat %s: %v", file, err)
+					continue
+				}
+				files = append(files, fileInfo{
+					path:    file,
+					modTime: info.ModTime(),
+				})
+			}
+			
+			// Sort by modification time (oldest first)
+			for i := 0; i < len(files)-1; i++ {
+				for j := i + 1; j < len(files); j++ {
+					if files[i].modTime.After(files[j].modTime) {
+						files[i], files[j] = files[j], files[i]
+					}
+				}
+			}
+			
+			// Remove oldest files (keep last 5)
+			filesToRemove := len(files) - 5
+			for i := 0; i < filesToRemove; i++ {
+				if err := os.Remove(files[i].path); err != nil {
+					log.Printf("Warning: Failed to remove old backup %s: %v", files[i].path, err)
+				} else {
+					log.Printf("🗑️  Removed old backup: %s", filepath.Base(files[i].path))
+				}
+			}
+			
+			log.Printf("✅ Cleaned up %s: kept %d backups, removed %d old backups", 
+				filepath.Base(dir), 5, filesToRemove)
+		}
+	}
+	
+	return nil
 } 
