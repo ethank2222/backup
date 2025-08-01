@@ -100,6 +100,7 @@ jobs:
                         }]
                       }' "$WEBHOOK_URL" || echo "⚠️  Failed to send webhook"
                   fi
+              continue-on-error: true
 
             - name: Run backup script
               id: backup
@@ -124,7 +125,7 @@ jobs:
                           return
                       fi
                       
-                                             local payload=$(cat <<'EOF'
+                      local payload=$(cat <<'EOF'
 {
   "type": "message",
   "attachments": [{
@@ -178,8 +179,8 @@ EOF
                   else
                       echo "❌ Backup script failed"
                       send_webhook "❌ GitHub Backup Failed" "Backup script failed during compilation or execution"
-                                              exit 1
-                    fi
+                      exit 1
+                  fi
               continue-on-error: true
 
             - name: Send backup script failure webhook
@@ -220,6 +221,7 @@ EOF
                         }]
                       }' "$WEBHOOK_URL" || echo "⚠️  Failed to send webhook"
                   fi
+              continue-on-error: true
 
             - name: Check for changes
               id: changes
@@ -231,6 +233,7 @@ EOF
                     echo "no_changes=false" >> $GITHUB_OUTPUT
                     echo "ℹ️  Changes detected"
                   fi
+              continue-on-error: true
 
             - name: Commit and push changes
               id: commit_push
@@ -280,6 +283,7 @@ EOF
                         }]
                       }' "$WEBHOOK_URL" || echo "⚠️  Failed to send webhook"
                   fi
+              continue-on-error: true
 
     cleanup:
         name: Cleanup
