@@ -2,10 +2,12 @@ package main
 
 import (
 	"archive/zip"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -13,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -40,23 +43,43 @@ type Summary struct {
 	Duration time.Duration
 }
 
+var (
+	lastWebhookTime time.Time
+	webhookMutex    sync.Mutex
+	logger          *slog.Logger
+)
+
 func main() {
-	// Set up logging with timestamp
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	// Set up structured logging
+	logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.Attr{Key: "time", Value: slog.StringValue(a.Value.Time().Format("2006-01-02 15:04:05"))}
+			}
+			return a
+		},
+	}))
+	slog.SetDefault(logger)
 	
-	// Track backup summary
+	// Track backup summary and early failure
 	var summary Summary
+	earlyFailure := false
+	earlyFailureMessage := ""
 	
 	// Ensure notification is always sent, even on panic
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("❌ Panic occurred: %v", r)
+			logger.Error("Panic occurred", "panic", r)
 			sendNotification("panic", "Backup process panicked", []string{})
 			return
 		}
 		
 		// Send appropriate notification based on backup result
-		if summary.Total == 0 {
+		if earlyFailure {
+			// Early failure occurred
+			sendNotification("failure", earlyFailureMessage, []string{})
+		} else if summary.Total == 0 {
 			// No backup was attempted (early failure)
 			sendNotification("failure", "Backup process failed before starting", []string{})
 		} else if summary.Failed == summary.Total {
@@ -85,23 +108,32 @@ func main() {
 	
 	// Validate environment
 	if err := validateEnvironment(); err != nil {
-		log.Fatal("Environment validation failed:", err)
+		logger.Error("Environment validation failed", "error", err)
+		earlyFailure = true
+		earlyFailureMessage = fmt.Sprintf("Environment validation failed: %v", err)
+		return
 	}
 	
 	// Setup Git configuration
 	if err := setupGit(); err != nil {
-		log.Printf("Warning: Git setup failed: %v", err)
+		logger.Warn("Git setup failed", "error", err)
 	}
 	
 	// Load config
 	config, err := loadConfig()
 	if err != nil {
-		log.Fatal("Failed to load configuration:", err)
+		logger.Error("Failed to load configuration", "error", err)
+		earlyFailure = true
+		earlyFailureMessage = fmt.Sprintf("Failed to load configuration: %v", err)
+		return
 	}
 	
 	// Validate repositories
 	if len(config.Repos) == 0 {
-		log.Fatal("No repositories found in repositories.txt")
+		logger.Error("No repositories found in repositories.txt")
+		earlyFailure = true
+		earlyFailureMessage = "No repositories found in repositories.txt"
+		return
 	}
 	
 	// Run backup
@@ -109,13 +141,13 @@ func main() {
 	
 	// Save backup results
 	if err := saveBackupResults(summary); err != nil {
-		log.Printf("Warning: Failed to save backup results: %v", err)
+		logger.Warn("Failed to save backup results", "error", err)
 	}
 	
 	// Commit and push changes
 	_, err = commitAndPush()
 	if err != nil {
-		log.Printf("Warning: Failed to commit/push: %v", err)
+		logger.Warn("Failed to commit/push", "error", err)
 	}
 	
 	// Print summary
@@ -124,10 +156,8 @@ func main() {
 	// Run cleanup checks
 	runCleanupChecks()
 	
-	// Exit with appropriate code
-	if summary.Failed > 0 {
-		os.Exit(1)
-	}
+	// Note: Exit code is handled by the defer function and webhook notifications
+	// No need for os.Exit() as it would bypass the defer function
 }
 
 func validateEnvironment() error {
@@ -148,7 +178,7 @@ func validateEnvironment() error {
 	
 	// du command is optional (we have fallback)
 	if _, err := exec.LookPath("du"); err != nil {
-		log.Printf("Warning: du command not found, will use fallback size calculation")
+		logger.Warn("du command not found, will use fallback size calculation")
 	}
 	
 	return nil
@@ -184,7 +214,7 @@ func loadConfig() (Config, error) {
 			if isValidRepoURL(line) {
 				repos = append(repos, line)
 			} else {
-				log.Printf("Warning: Invalid repository URL: %s", line)
+				logger.Warn("Invalid repository URL", "url", line)
 			}
 		}
 	}
@@ -197,8 +227,8 @@ func loadConfig() (Config, error) {
 }
 
 func isValidRepoURL(url string) bool {
-	// Basic GitHub URL validation
-	pattern := `^https://github\.com/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+(/.*)?$`
+	// Strict GitHub URL validation - only allow valid repository paths
+	pattern := `^https://github\.com/[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?/[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$`
 	matched, _ := regexp.MatchString(pattern, url)
 	return matched
 }
@@ -211,7 +241,7 @@ func runBackup(config Config) Summary {
 	for _, repo := range config.Repos {
 		repoName := extractRepoName(repo)
 		if repoName == "" {
-			log.Printf("❌ Failed to extract repo name from: %s", repo)
+			logger.Error("Failed to extract repo name from URL", "url", repo)
 			results = append(results, Result{
 				Repo:    repo,
 				Success: false,
@@ -222,7 +252,7 @@ func runBackup(config Config) Summary {
 		
 		backupDir := filepath.Join("backups", repoName, time.Now().Format("2006-01-02"))
 		if err := os.MkdirAll(backupDir, 0755); err != nil {
-			log.Printf("❌ Failed to create backup directory for %s: %v", repoName, err)
+			logger.Error("Failed to create backup directory", "repo", repoName, "error", err)
 			results = append(results, Result{
 				Repo:    repo,
 				Success: false,
@@ -271,8 +301,19 @@ func extractRepoName(repoURL string) string {
 		return ""
 	}
 	
+	// Sanitize owner and repo names to prevent path traversal
+	owner := sanitizePathComponent(parts[len(parts)-2])
+	repo := sanitizePathComponent(parts[len(parts)-1])
+	
 	// Return owner/repo format
-	return fmt.Sprintf("%s/%s", parts[len(parts)-2], parts[len(parts)-1])
+	return fmt.Sprintf("%s/%s", owner, repo)
+}
+
+func sanitizePathComponent(component string) string {
+	// Remove any potentially dangerous characters
+	// Only allow alphanumeric, dots, hyphens, and underscores
+	pattern := regexp.MustCompile(`[^a-zA-Z0-9._-]`)
+	return pattern.ReplaceAllString(component, "")
 }
 
 func backupRepo(repoURL, repoName, backupDir string) Result {
@@ -301,7 +342,7 @@ func backupRepo(repoURL, repoName, backupDir string) Result {
 	// Get directory size
 	size, err := getDirectorySize(backupDir)
 	if err != nil {
-		log.Printf("Warning: Failed to get directory size for %s: %v", repoName, err)
+		logger.Warn("Failed to get directory size", "repo", repoName, "error", err)
 	}
 	
 	// Create ZIP file
@@ -309,7 +350,7 @@ func backupRepo(repoURL, repoName, backupDir string) Result {
 	if err := zipDirectory(backupDir, zipPath); err != nil {
 		// Clean up backup directory on ZIP failure
 		if cleanupErr := os.RemoveAll(backupDir); cleanupErr != nil {
-			log.Printf("Warning: Failed to cleanup backup directory after ZIP failure: %v", cleanupErr)
+			logger.Warn("Failed to cleanup backup directory after ZIP failure", "repo", repoName, "error", cleanupErr)
 		}
 		return Result{
 			Repo:    repoURL,
@@ -321,16 +362,16 @@ func backupRepo(repoURL, repoName, backupDir string) Result {
 	// Get ZIP file size
 	zipSize, err := getFileSize(zipPath)
 	if err != nil {
-		log.Printf("Warning: Failed to get ZIP size for %s: %v", repoName, err)
+		logger.Warn("Failed to get ZIP size", "repo", repoName, "error", err)
 	}
 	
 	// Remove original directory
 	if err := os.RemoveAll(backupDir); err != nil {
-		log.Printf("Warning: Failed to remove backup directory for %s: %v", repoName, err)
+		logger.Warn("Failed to remove backup directory", "repo", repoName, "error", err)
 	}
 	
 	duration := time.Since(start)
-	log.Printf("✅ Backed up %s (%s -> %s)", repoName, byteCountDecimal(size), byteCountDecimal(zipSize))
+	logger.Info("Backed up repository", "repo", repoName, "size", byteCountDecimal(size), "zipSize", byteCountDecimal(zipSize), "duration", duration)
 	
 	return Result{
 		Repo:     repoURL,
@@ -353,8 +394,9 @@ func constructAuthenticatedURL(repoURL string) string {
 
 func cloneRepository(repoURL, backupDir string) error {
 	cmd := exec.Command("git", "clone", "--mirror", repoURL, backupDir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// Suppress output to prevent token exposure in logs
+	cmd.Stdout = nil
+	cmd.Stderr = nil
 	return cmd.Run()
 }
 
@@ -485,7 +527,7 @@ func commitAndPush() (bool, error) {
 	
 	// Check if output is empty (no changes)
 	if len(strings.TrimSpace(string(output))) == 0 {
-		log.Println("ℹ️  No changes to commit")
+		logger.Info("No changes to commit")
 		return true, nil
 	}
 	
@@ -507,25 +549,38 @@ func commitAndPush() (bool, error) {
 		
 		// Push changes
 		cmd = exec.Command("git", "push", "origin", "main")
+		// Suppress output to prevent token exposure in logs
+		cmd.Stdout = nil
+		cmd.Stderr = nil
 		if err := cmd.Run(); err != nil {
 			return false, fmt.Errorf("failed to push changes: %v", err)
 		}
 		
-		log.Println("✅ Changes committed and pushed")
+		logger.Info("Changes committed and pushed")
 		return false, nil
 	}
 	
 	// No staged changes after adding
-	log.Println("ℹ️  No changes to commit after adding")
+	logger.Info("No changes to commit after adding")
 	return true, nil
 }
 
 func sendNotification(status, message string, successfulRepos []string) {
 	webhookURL := os.Getenv("WEBHOOK_URL")
 	if webhookURL == "" {
-		log.Println("⚠️  No webhook URL configured, skipping notification")
+		logger.Warn("No webhook URL configured, skipping notification")
 		return
 	}
+	
+	// Simple rate limiting - prevent webhook spam
+	webhookMutex.Lock()
+	if time.Since(lastWebhookTime) < 5*time.Second {
+		logger.Warn("Rate limiting webhook notifications")
+		webhookMutex.Unlock()
+		return
+	}
+	lastWebhookTime = time.Now()
+	webhookMutex.Unlock()
 	
 	// Determine notification details based on status
 	var title, color string
@@ -622,82 +677,75 @@ func sendNotification(status, message string, successfulRepos []string) {
 		},
 	}
 	
-	// Send webhook with timeout
-	client := &http.Client{Timeout: 30 * time.Second}
+	// Send webhook with timeout and proper TLS configuration
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			},
+		},
+	}
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("Warning: failed to marshal webhook message: %v", err)
+		logger.Warn("failed to marshal webhook message", "error", err)
 		return
 	}
 	
 	resp, err := client.Post(webhookURL, "application/json", strings.NewReader(string(jsonData)))
 	if err != nil {
-		log.Printf("Warning: failed to send webhook: %v", err)
+		logger.Warn("failed to send webhook", "error", err)
 		return
 	}
 	defer resp.Body.Close()
 	
 	if resp.StatusCode >= 400 {
-		log.Printf("Warning: webhook returned status code %d", resp.StatusCode)
+		logger.Warn("webhook returned status code", "statusCode", resp.StatusCode)
 		return
 	}
 	
-	log.Printf("✅ Webhook notification sent successfully (%s)", status)
+	logger.Info("Webhook notification sent successfully", "status", status)
 }
 
 func printSummary(summary Summary) {
-	log.Printf("\n📊 Backup Summary:")
-	log.Printf("   Total repositories: %d", summary.Total)
-	log.Printf("   Successful: %d", summary.Success)
-	log.Printf("   Failed: %d", summary.Failed)
-	log.Printf("   Duration: %v", summary.Duration)
+	logger.Info("Backup Summary", "totalRepos", summary.Total, "successful", summary.Success, "failed", summary.Failed, "duration", summary.Duration)
 	
 	if summary.Failed > 0 {
-		log.Printf("\n❌ Failed backups:")
-		for _, result := range summary.Results {
-			if !result.Success {
-				log.Printf("   - %s: %s", result.Repo, result.Error)
-			}
-		}
+		logger.Error("Failed backups", "results", summary.Results)
 	}
 	
 	if summary.Success > 0 {
-		log.Printf("\n✅ Successful backups:")
-		for _, result := range summary.Results {
-			if result.Success {
-				log.Printf("   - %s (%s -> %s)", result.Repo, byteCountDecimal(result.Size), byteCountDecimal(result.ZipSize))
-			}
-		}
+		logger.Info("Successful backups", "results", summary.Results)
 	}
 }
 
 func runCleanupChecks() {
-	log.Println("ℹ️  Running cleanup checks...")
+	logger.Info("Running cleanup checks...")
 	
 	// Check for backup results file
 	if _, err := os.Stat("backup-results.json"); err == nil {
-		log.Println("ℹ️  Found backup results file")
+		logger.Info("Found backup results file")
 	}
 	
 	// Check backup directory
 	if _, err := os.Stat("backups"); err == nil {
-		log.Println("ℹ️  Backup directory exists")
+		logger.Info("Backup directory exists")
 		
 		// Count ZIP files
 		zipFiles, err := filepath.Glob("backups/**/*.zip")
 		if err == nil {
-			log.Printf("  - ZIP files: %d", len(zipFiles))
+			logger.Info("ZIP files", "count", len(zipFiles))
 		}
 		
 		// Clean up old backups (keep only last 5)
 		if err := cleanupOldBackups(); err != nil {
-			log.Printf("Warning: Failed to cleanup old backups: %v", err)
+			logger.Warn("Failed to cleanup old backups", "error", err)
 		}
 	} else {
-		log.Println("⚠️  No backup directory found")
+		logger.Warn("No backup directory found")
 	}
 	
-	log.Printf("✅ Cleanup checks completed")
+	logger.Info("Cleanup checks completed")
 }
 
 func cleanupOldBackups() error {
@@ -717,7 +765,7 @@ func cleanupOldBackups() error {
 		// Find all ZIP files in this directory
 		zipFiles, err := filepath.Glob(filepath.Join(dir, "*.zip"))
 		if err != nil {
-			log.Printf("Warning: Failed to find ZIP files in %s: %v", dir, err)
+			logger.Warn("Failed to find ZIP files in directory", "dir", dir, "error", err)
 			continue
 		}
 		
@@ -733,7 +781,7 @@ func cleanupOldBackups() error {
 			for _, file := range zipFiles {
 				info, err := os.Stat(file)
 				if err != nil {
-					log.Printf("Warning: Failed to stat %s: %v", file, err)
+					logger.Warn("Failed to stat file", "file", file, "error", err)
 					continue
 				}
 				files = append(files, fileInfo{
@@ -755,14 +803,13 @@ func cleanupOldBackups() error {
 			filesToRemove := len(files) - 5
 			for i := 0; i < filesToRemove; i++ {
 				if err := os.Remove(files[i].path); err != nil {
-					log.Printf("Warning: Failed to remove old backup %s: %v", files[i].path, err)
+					logger.Warn("Failed to remove old backup", "file", files[i].path, "error", err)
 				} else {
-					log.Printf("🗑️  Removed old backup: %s", filepath.Base(files[i].path))
+					logger.Info("Removed old backup", "file", filepath.Base(files[i].path))
 				}
 			}
 			
-			log.Printf("✅ Cleaned up %s: kept %d backups, removed %d old backups", 
-				filepath.Base(dir), 5, filesToRemove)
+			logger.Info("Cleaned up directory", "dir", filepath.Base(dir), "keptBackups", 5, "removedBackups", filesToRemove)
 		}
 	}
 	
