@@ -8,37 +8,27 @@ jobs:
     backup:
         name: Backup Repositories
         runs-on: ubuntu-latest
-        env:
-            WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-            GITHUB_REPOSITORY: ${{ github.repository }}
-            GITHUB_RUN_ID: ${{ github.run_id }}
         steps:
             - name: Checkout backup repository
-              id: checkout
               uses: actions/checkout@v4
               with:
                   token: ${{ secrets.BACKUP_TOKEN }}
                   fetch-depth: 0
-              continue-on-error: true
 
             - name: Setup Git user
-              id: git_setup
               run: |
                   git config --global user.name "Backup Bot"
                   git config --global user.email "ethank2222@gmail.com"
-              continue-on-error: true
 
             - name: Setup Go
-              id: go_setup
               uses: actions/setup-go@v4
               with:
                   go-version: "1.21"
-              continue-on-error: true
 
             - name: Validate environment
-              id: validate_env
               env:
                   BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+                  GITHUB_REPOSITORY: ${{ github.repository }}
               run: |
                   if [ -z "$BACKUP_TOKEN" ]; then
                     echo "❌ Error: BACKUP_TOKEN not set"
@@ -49,57 +39,6 @@ jobs:
                     exit 1
                   fi
                   echo "✅ Environment validated"
-              continue-on-error: true
-
-            - name: Send failure webhook
-              if: steps.checkout.outcome == 'failure' || steps.git_setup.outcome == 'failure' || steps.go_setup.outcome == 'failure' || steps.validate_env.outcome == 'failure'
-              run: |
-                  if [ -n "$WEBHOOK_URL" ]; then
-                      # Determine error message based on which step failed
-                      if [ "${{ steps.checkout.outcome }}" == "failure" ]; then
-                          error_msg="Repository checkout failed"
-                      elif [ "${{ steps.git_setup.outcome }}" == "failure" ]; then
-                          error_msg="Git configuration failed"
-                      elif [ "${{ steps.go_setup.outcome }}" == "failure" ]; then
-                          error_msg="Go environment setup failed"
-                      elif [ "${{ steps.validate_env.outcome }}" == "failure" ]; then
-                          error_msg="Environment validation failed"
-                      fi
-                      
-                      curl -X POST -H "Content-Type: application/json" -d '{
-                        "type": "message",
-                        "attachments": [{
-                          "contentType": "application/vnd.microsoft.card.adaptive",
-                          "content": {
-                            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                            "type": "AdaptiveCard",
-                            "version": "1.3",
-                            "body": [{
-                              "type": "TextBlock",
-                              "text": "❌ GitHub Backup Failed",
-                              "weight": "Bolder",
-                              "size": "Large"
-                            }, {
-                              "type": "TextBlock",
-                              "text": "Backup setup failed on '"$(date +%Y-%m-%d)"'",
-                              "wrap": true
-                            }, {
-                              "type": "TextBlock",
-                              "text": "[View Workflow](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
-                            }, {
-                              "type": "FactSet",
-                              "facts": [
-                                {"title": "Timestamp:", "value": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"},
-                                {"title": "Status:", "value": "Failure"},
-                                {"title": "Repository:", "value": "'$GITHUB_REPOSITORY'"},
-                                {"title": "Workflow Run ID:", "value": "'$GITHUB_RUN_ID'"},
-                                {"title": "Error:", "value": "'"$error_msg"'"}
-                              ]
-                            }]
-                          }
-                        }]
-                      }' "$WEBHOOK_URL" || echo "⚠️  Failed to send webhook"
-                  fi
 
             - name: Run backup script
               id: backup
@@ -110,67 +49,14 @@ jobs:
                   GITHUB_REPOSITORY: ${{ github.repository }}
                   GITHUB_RUN_ID: ${{ github.run_id }}
               run: |
+                  # Mask token in logs for additional security
                   echo "::add-mask::$BACKUP_TOKEN"
                   echo "🚀 Starting backup process..."
-
-                  # Function to send webhook notification
-                  send_webhook() {
-                      local status="$1"
-                      local message="$2"
-                      local webhook_url="$WEBHOOK_URL"
-                      
-                      if [ -z "$webhook_url" ]; then
-                          echo "⚠️  No webhook URL configured, skipping notification"
-                          return
-                      fi
-                      
-                      local payload=$(cat <<EOF
-                        {
-                          "type": "message",
-                          "attachments": [{
-                            "contentType": "application/vnd.microsoft.card.adaptive",
-                            "content": {
-                              "\$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                              "type": "AdaptiveCard",
-                              "version": "1.3",
-                              "body": [{
-                                "type": "TextBlock",
-                                "text": "$status",
-                                "weight": "Bolder",
-                                "size": "Large"
-                              }, {
-                                "type": "TextBlock",
-                                "text": "$message on $(date +%Y-%m-%d)",
-                                "wrap": true
-                              }, {
-                                "type": "TextBlock",
-                                "text": "[View Workflow](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
-                              }, {
-                                "type": "FactSet",
-                                "facts": [
-                                  {"title": "Timestamp:", "value": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"},
-                                  {"title": "Status:", "value": "Failure"},
-                                  {"title": "Repository:", "value": "$GITHUB_REPOSITORY"},
-                                  {"title": "Workflow Run ID:", "value": "$GITHUB_RUN_ID"}
-                                ]
-                              }]
-                            }
-                          }]
-                        }
-                        EOF
-                      )
-                      
-                      curl -X POST -H "Content-Type: application/json" -d "$payload" "$webhook_url" || echo "⚠️  Failed to send webhook"
-                  }
-
-                  if go run backup.go; then
-                      echo "✅ Backup script completed successfully"
-                      send_webhook "✅ GitHub Backup Successful" "Backup completed successfully"
-                  else
-                      echo "❌ Backup script failed"
-                      send_webhook "❌ GitHub Backup Failed" "Backup script failed during compilation or execution"
-                      exit 1
+                  if ! go run backup.go; then
+                    echo "❌ Backup script failed"
+                    exit 1
                   fi
+                  echo "✅ Backup script completed successfully"
 
             - name: Check for changes
               id: changes
@@ -184,53 +70,12 @@ jobs:
                   fi
 
             - name: Commit and push changes
-              id: commit_push
               if: steps.changes.outputs.no_changes != 'true'
               run: |
                   git add .
                   git commit -m "Daily mirror backup - $(date +%Y-%m-%d)"
                   git push origin main
                   echo "✅ Changes committed and pushed"
-              continue-on-error: true
-
-            - name: Send commit/push failure webhook
-              if: steps.commit_push.outcome == 'failure'
-              run: |
-                  if [ -n "$WEBHOOK_URL" ]; then
-                      curl -X POST -H "Content-Type: application/json" -d '{
-                        "type": "message",
-                        "attachments": [{
-                          "contentType": "application/vnd.microsoft.card.adaptive",
-                          "content": {
-                            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                            "type": "AdaptiveCard",
-                            "version": "1.3",
-                            "body": [{
-                              "type": "TextBlock",
-                              "text": "⚠️ GitHub Backup Warning",
-                              "weight": "Bolder",
-                              "size": "Large"
-                            }, {
-                              "type": "TextBlock",
-                              "text": "Backup completed but commit/push failed on '"$(date +%Y-%m-%d)"'",
-                              "wrap": true
-                            }, {
-                              "type": "TextBlock",
-                              "text": "[View Workflow](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
-                            }, {
-                              "type": "FactSet",
-                              "facts": [
-                                {"title": "Timestamp:", "value": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"},
-                                {"title": "Status:", "value": "Warning"},
-                                {"title": "Repository:", "value": "'$GITHUB_REPOSITORY'"},
-                                {"title": "Workflow Run ID:", "value": "'$GITHUB_RUN_ID'"},
-                                {"title": "Error:", "value": "Git commit/push failed"}
-                              ]
-                            }]
-                          }
-                        }]
-                      }' "$WEBHOOK_URL" || echo "⚠️  Failed to send webhook"
-                  fi
 
     cleanup:
         name: Cleanup
@@ -247,6 +92,8 @@ jobs:
                   go-version: "1.21"
 
             - name: Run cleanup checks
+              env:
+                  GITHUB_REPOSITORY: ${{ github.repository }}
               run: |
                   echo "ℹ️  Running cleanup checks..."
                   if [ -f backup-results.json ]; then
