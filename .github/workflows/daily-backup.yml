@@ -124,41 +124,50 @@ jobs:
                           return
                       fi
                       
-                      local payload=$(cat <<EOF
-                        {
-                          "type": "message",
-                          "attachments": [{
-                            "contentType": "application/vnd.microsoft.card.adaptive",
-                            "content": {
-                              "\$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                              "type": "AdaptiveCard",
-                              "version": "1.3",
-                              "body": [{
-                                "type": "TextBlock",
-                                "text": "$status",
-                                "weight": "Bolder",
-                                "size": "Large"
-                              }, {
-                                "type": "TextBlock",
-                                "text": "$message on $(date +%Y-%m-%d)",
-                                "wrap": true
-                              }, {
-                                "type": "TextBlock",
-                                "text": "[View Workflow](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
-                              }, {
-                                "type": "FactSet",
-                                "facts": [
-                                  {"title": "Timestamp:", "value": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"},
-                                  {"title": "Status:", "value": "Failure"},
-                                  {"title": "Repository:", "value": "$GITHUB_REPOSITORY"},
-                                  {"title": "Workflow Run ID:", "value": "$GITHUB_RUN_ID"}
-                                ]
-                              }]
-                            }
-                          }]
-                        }
-                        EOF
+                                             local payload=$(cat <<'EOF'
+{
+  "type": "message",
+  "attachments": [{
+    "contentType": "application/vnd.microsoft.card.adaptive",
+    "content": {
+      "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+      "type": "AdaptiveCard",
+      "version": "1.3",
+      "body": [{
+        "type": "TextBlock",
+        "text": "STATUS_PLACEHOLDER",
+        "weight": "Bolder",
+        "size": "Large"
+      }, {
+        "type": "TextBlock",
+        "text": "MESSAGE_PLACEHOLDER",
+        "wrap": true
+      }, {
+        "type": "TextBlock",
+        "text": "WORKFLOW_LINK_PLACEHOLDER"
+      }, {
+        "type": "FactSet",
+        "facts": [
+          {"title": "Timestamp:", "value": "TIMESTAMP_PLACEHOLDER"},
+          {"title": "Status:", "value": "STATUS_VALUE_PLACEHOLDER"},
+          {"title": "Repository:", "value": "REPO_PLACEHOLDER"},
+          {"title": "Workflow Run ID:", "value": "RUN_ID_PLACEHOLDER"}
+        ]
+      }]
+    }
+  }]
+}
+EOF
                       )
+                      
+                      # Replace placeholders with actual values
+                      payload=$(echo "$payload" | sed "s/STATUS_PLACEHOLDER/$status/g")
+                      payload=$(echo "$payload" | sed "s/MESSAGE_PLACEHOLDER/$message on $(date +%Y-%m-%d)/g")
+                      payload=$(echo "$payload" | sed "s/WORKFLOW_LINK_PLACEHOLDER/[View Workflow](https:\/\/github.com\/$GITHUB_REPOSITORY\/actions\/runs\/$GITHUB_RUN_ID)/g")
+                      payload=$(echo "$payload" | sed "s/TIMESTAMP_PLACEHOLDER/$(date -u +%Y-%m-%dT%H:%M:%SZ)/g")
+                      payload=$(echo "$payload" | sed "s/STATUS_VALUE_PLACEHOLDER/Failure/g")
+                      payload=$(echo "$payload" | sed "s/REPO_PLACEHOLDER/$GITHUB_REPOSITORY/g")
+                      payload=$(echo "$payload" | sed "s/RUN_ID_PLACEHOLDER/$GITHUB_RUN_ID/g")
                       
                       curl -X POST -H "Content-Type: application/json" -d "$payload" "$webhook_url" || echo "⚠️  Failed to send webhook"
                   }
@@ -169,7 +178,47 @@ jobs:
                   else
                       echo "❌ Backup script failed"
                       send_webhook "❌ GitHub Backup Failed" "Backup script failed during compilation or execution"
-                      exit 1
+                                              exit 1
+                    fi
+              continue-on-error: true
+
+            - name: Send backup script failure webhook
+              if: steps.backup.outcome == 'failure'
+              run: |
+                  if [ -n "$WEBHOOK_URL" ]; then
+                      curl -X POST -H "Content-Type: application/json" -d '{
+                        "type": "message",
+                        "attachments": [{
+                          "contentType": "application/vnd.microsoft.card.adaptive",
+                          "content": {
+                            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                            "type": "AdaptiveCard",
+                            "version": "1.3",
+                            "body": [{
+                              "type": "TextBlock",
+                              "text": "❌ GitHub Backup Failed",
+                              "weight": "Bolder",
+                              "size": "Large"
+                            }, {
+                              "type": "TextBlock",
+                              "text": "Backup script failed on '"$(date +%Y-%m-%d)"'",
+                              "wrap": true
+                            }, {
+                              "type": "TextBlock",
+                              "text": "[View Workflow](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+                            }, {
+                              "type": "FactSet",
+                              "facts": [
+                                {"title": "Timestamp:", "value": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"},
+                                {"title": "Status:", "value": "Failure"},
+                                {"title": "Repository:", "value": "'$GITHUB_REPOSITORY'"},
+                                {"title": "Workflow Run ID:", "value": "'$GITHUB_RUN_ID'"},
+                                {"title": "Error:", "value": "Backup script execution failed"}
+                              ]
+                            }]
+                          }
+                        }]
+                      }' "$WEBHOOK_URL" || echo "⚠️  Failed to send webhook"
                   fi
 
             - name: Check for changes
