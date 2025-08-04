@@ -195,6 +195,18 @@ func setupGit() error {
 		return fmt.Errorf("failed to set git user email: %v", err)
 	}
 	
+	// Disable credential prompts to prevent authentication issues
+	cmd = exec.Command("git", "config", "--global", "credential.helper", "store")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to set git credential helper: %v", err)
+	}
+	
+	// Set core.autocrlf to false to prevent line ending issues
+	cmd = exec.Command("git", "config", "--global", "core.autocrlf", "false")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to set git autocrlf: %v", err)
+	}
+	
 	return nil
 }
 
@@ -250,7 +262,7 @@ func runBackup(config Config) Summary {
 		}
 		
 		backupDir := filepath.Join("backups", repoName, time.Now().Format("2006-01-02"))
-		if err := os.MkdirAll(backupDir, 0755); err != nil {
+		if err := os.MkdirAll(backupDir, 0750); err != nil {
 			logger.Error("Failed to create backup directory", "repo", repoName, "error", err)
 			results = append(results, Result{
 				Repo:    repo,
@@ -326,17 +338,47 @@ func backupRepo(repoURL, repoName, backupDir string) Result {
 	
 	start := time.Now()
 	
+	// Check if repository is accessible
+	if err := checkRepositoryAccess(repoURL); err != nil {
+		return Result{
+			Repo:    repoURL,
+			Success: false,
+			Error:   fmt.Sprintf("Repository access check failed: %v", err),
+		}
+	}
+	
 	// Construct authenticated URL
 	authURL := constructAuthenticatedURL(repoURL)
 	
+	// Log the authentication status (without exposing the token)
+	token := os.Getenv("BACKUP_TOKEN")
+	if token == "" {
+		logger.Warn("No BACKUP_TOKEN found, using unauthenticated access", "repo", repoName)
+	} else {
+		logger.Info("Using authenticated access", "repo", repoName, "tokenLength", len(token))
+		
+		// Test the token format
+		if len(token) < 20 {
+			logger.Warn("Token seems too short", "repo", repoName, "tokenLength", len(token))
+		}
+		
+		// Check if token contains any special characters that might cause issues
+		if strings.ContainsAny(token, " \t\n\r") {
+			logger.Warn("Token contains whitespace characters", "repo", repoName)
+		}
+	}
+	
 	// Clone repository
+	logger.Info("Starting repository clone", "repo", repoName, "backupDir", backupDir)
 	if err := cloneRepository(authURL, backupDir); err != nil {
+		logger.Error("Repository clone failed", "repo", repoName, "error", err)
 		return Result{
 			Repo:    repoURL,
 			Success: false,
 			Error:   fmt.Sprintf("Clone failed: %v", err),
 		}
 	}
+	logger.Info("Repository clone completed", "repo", repoName)
 	
 	// Get directory size
 	size, err := getDirectorySize(backupDir)
@@ -381,22 +423,125 @@ func backupRepo(repoURL, repoName, backupDir string) Result {
 	}
 }
 
+func checkRepositoryAccess(repoURL string) error {
+	token := os.Getenv("BACKUP_TOKEN")
+	if token == "" {
+		// Without token, we can't check access, so we'll try anyway
+		return nil
+	}
+	
+	// Add small delay to respect rate limits
+	time.Sleep(100 * time.Millisecond)
+	
+	// Extract owner and repo from URL
+	repoURL = strings.TrimSuffix(repoURL, ".git")
+	parts := strings.Split(repoURL, "/")
+	if len(parts) < 2 {
+		return fmt.Errorf("invalid repository URL format")
+	}
+	
+	owner := sanitizePathComponent(parts[len(parts)-2])
+	repo := sanitizePathComponent(parts[len(parts)-1])
+	
+	// Check repository access via GitHub API
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo)
+	
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %v", err)
+	}
+	
+	req.Header.Set("Authorization", fmt.Sprintf("token %s", token))
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("User-Agent", "GitHub-Backup-Tool/1.0")
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to check repository access: %v", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode == 404 {
+		return fmt.Errorf("repository not found or access denied")
+	} else if resp.StatusCode != 200 {
+		return fmt.Errorf("repository access check failed with status: %d", resp.StatusCode)
+	}
+	
+	return nil
+}
+
 func constructAuthenticatedURL(repoURL string) string {
 	token := os.Getenv("BACKUP_TOKEN")
 	if token == "" {
 		return repoURL
 	}
 	
-	// Replace https:// with https://token@
-	return strings.Replace(repoURL, "https://", fmt.Sprintf("https://%s@", token), 1)
+	// For GitHub, we need to use the token as the username
+	// The format should be: https://token@github.com/owner/repo.git
+	// But we need to handle the case where the URL might not end with .git
+	repoURL = strings.TrimSuffix(repoURL, ".git")
+	
+	// Ensure the token doesn't have any extra characters
+	token = strings.TrimSpace(token)
+	
+	// Validate token format (GitHub tokens are typically 40+ characters)
+	if len(token) < 20 {
+		logger.Warn("Token seems too short, may be invalid", "tokenLength", len(token))
+	}
+	
+	// Construct the authenticated URL
+	authURL := strings.Replace(repoURL, "https://github.com/", fmt.Sprintf("https://%s@github.com/", token), 1)
+	
+	// Log the URL format (without exposing the token)
+	logger.Debug("Constructed authenticated URL", "originalURL", repoURL, "authURLFormat", strings.Replace(authURL, token, "[TOKEN]", 1))
+	
+	return authURL
 }
 
 func cloneRepository(repoURL, backupDir string) error {
-	cmd := exec.Command("git", "clone", "--mirror", repoURL, backupDir)
-	// Suppress output to prevent token exposure in logs
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd.Run()
+	maxRetries := 3
+	retryDelay := 5 * time.Second
+	
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Remove existing directory if it exists (from previous failed attempts)
+		if attempt > 1 {
+			if err := os.RemoveAll(backupDir); err != nil {
+				logger.Warn("Failed to remove existing backup directory", "dir", backupDir, "error", err)
+			}
+		}
+		
+		cmd := exec.Command("git", "clone", "--mirror", repoURL, backupDir)
+		
+		// Capture stderr for error reporting while suppressing stdout to prevent token exposure
+		var stderr strings.Builder
+		cmd.Stdout = nil
+		cmd.Stderr = &stderr
+		
+		err := cmd.Run()
+		if err == nil {
+			return nil
+		}
+		
+		// Log the error without exposing the token
+		errorMsg := stderr.String()
+		// Remove any potential token exposure from error messages
+		errorMsg = strings.ReplaceAll(errorMsg, os.Getenv("BACKUP_TOKEN"), "[TOKEN]")
+		
+		logger.Warn("Git clone attempt failed", "attempt", attempt, "maxRetries", maxRetries, "error", errorMsg)
+		
+		if attempt < maxRetries {
+			logger.Info("Retrying git clone", "attempt", attempt+1, "delay", retryDelay)
+			time.Sleep(retryDelay)
+			// Increase delay for next attempt
+			retryDelay = time.Duration(float64(retryDelay) * 1.5)
+		}
+	}
+	
+	return fmt.Errorf("git clone failed after %d attempts", maxRetries)
 }
 
 func getDirectorySize(dir string) (int64, error) {
@@ -513,7 +658,7 @@ func saveBackupResults(summary Summary) error {
 		return fmt.Errorf("failed to marshal summary: %v", err)
 	}
 	
-	return os.WriteFile("backup-results.json", data, 0644)
+	return os.WriteFile("backup-results.json", data, 0640)
 }
 
 func commitAndPush() (bool, error) {
@@ -548,11 +693,15 @@ func commitAndPush() (bool, error) {
 		
 		// Push changes
 		cmd = exec.Command("git", "push", "origin", "main")
-		// Suppress output to prevent token exposure in logs
+		// Capture stderr for error reporting while suppressing stdout to prevent token exposure
+		var stderr strings.Builder
 		cmd.Stdout = nil
-		cmd.Stderr = nil
+		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
-			return false, fmt.Errorf("failed to push changes: %v", err)
+			errorMsg := stderr.String()
+			// Remove any potential token exposure from error messages
+			errorMsg = strings.ReplaceAll(errorMsg, os.Getenv("BACKUP_TOKEN"), "[TOKEN]")
+			return false, fmt.Errorf("failed to push changes: %v, stderr: %s", err, errorMsg)
 		}
 		
 		logger.Info("Changes committed and pushed")
@@ -691,7 +840,16 @@ func sendNotification(status, message string, successfulRepos []string) {
 		return
 	}
 	
-	resp, err := client.Post(webhookURL, "application/json", strings.NewReader(string(jsonData)))
+	req, err := http.NewRequest("POST", webhookURL, strings.NewReader(string(jsonData)))
+	if err != nil {
+		logger.Warn("failed to create webhook request", "error", err)
+		return
+	}
+	
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "GitHub-Backup-Tool/1.0")
+	
+	resp, err := client.Do(req)
 	if err != nil {
 		logger.Warn("failed to send webhook", "error", err)
 		return
