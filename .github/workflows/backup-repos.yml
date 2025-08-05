@@ -1,4 +1,4 @@
-name: Repository Backup
+name: Repository Backup (Alternative)
 
 on:
     schedule:
@@ -44,7 +44,7 @@ jobs:
                   FAILED_REPOS=""
                   DATE_PREFIX=$(date +%Y%m%d_%H%M%S)
 
-                  # Function to send webhook
+                  # Function to send webhook (Teams/Power Automate compatible)
                   send_webhook() {
                     if [ -z "$WEBHOOK_URL" ]; then
                       return 0
@@ -52,15 +52,75 @@ jobs:
                     
                     local success="$1"
                     local message="$2"
+                    local color=$([ "$success" = "true" ] && echo "00FF00" || echo "FF0000")
+                    local status=$([ "$success" = "true" ] && echo "✅ Success" || echo "❌ Failed")
+                    
+                    # Create adaptive card format for Teams/Power Automate
+                    local payload=$(cat <<EOF
+                  {
+                    "@type": "MessageCard",
+                    "@context": "http://schema.org/extensions",
+                    "themeColor": "$color",
+                    "summary": "Repository Backup $status",
+                    "sections": [{
+                      "activityTitle": "GitHub Repository Backup",
+                      "activitySubtitle": "$(date -u '+%Y-%m-%d %H:%M:%S UTC')",
+                      "activityImage": "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+                      "facts": [
+                        {
+                          "name": "Status",
+                          "value": "$status"
+                        },
+                        {
+                          "name": "Result",
+                          "value": "$message"
+                        },
+                        {
+                          "name": "Workflow",
+                          "value": "repository-backup"
+                        },
+                        {
+                          "name": "Run ID",
+                          "value": "${GITHUB_RUN_ID:-N/A}"
+                        }
+                      ],
+                      "markdown": true
+                    }],
+                    "potentialAction": [{
+                      "@type": "OpenUri",
+                      "name": "View Workflow Run",
+                      "targets": [{
+                        "os": "default",
+                        "uri": "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID:-}"
+                      }]
+                    }],
+                    "attachments": [{
+                      "contentType": "application/vnd.microsoft.card.adaptive",
+                      "content": {
+                        "type": "AdaptiveCard",
+                        "version": "1.0",
+                        "body": [
+                          {
+                            "type": "TextBlock",
+                            "size": "Medium",
+                            "weight": "Bolder",
+                            "text": "Repository Backup $status"
+                          },
+                          {
+                            "type": "TextBlock",
+                            "text": "$message",
+                            "wrap": true
+                          }
+                        ]
+                      }
+                    }]
+                  }
+                  EOF
+                  )
                     
                     curl -X POST "$WEBHOOK_URL" \
                       -H "Content-Type: application/json" \
-                      -d "{
-                        \"success\": $success,
-                        \"message\": \"$message\",
-                        \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",
-                        \"workflow\": \"repository-backup\"
-                      }" \
+                      -d "$payload" \
                       --max-time 10 || true
                   }
 
@@ -69,9 +129,8 @@ jobs:
                     local repo_url="$1"
                     local repo_name=$(basename "$repo_url" .git)
                     local temp_dir=$(mktemp -d)
-                    local current_dir=$(pwd)
                     
-                    echo "📦 Backing up: $repo_name"
+                    echo "📦 Backing up: $repo_name ($repo_url)"
                     
                     # Clone repository
                     if [ -n "$GITHUB_TOKEN" ] && [[ "$repo_url" == *"github.com"* ]]; then
@@ -81,29 +140,26 @@ jobs:
                       local auth_url="$repo_url"
                     fi
                     
-                    # Clone with error output for debugging
-                    local clone_error=$(mktemp)
-                    if ! git clone --mirror "$auth_url" "$temp_dir/$repo_name" 2>"$clone_error"; then
+                    # Clone with stdin redirected to prevent any consumption issues
+                    if ! git clone --mirror "$auth_url" "$temp_dir/$repo_name" </dev/null 2>/dev/null; then
                       echo "❌ Failed to clone: $repo_name"
-                      # Show error for debugging (remove in production if sensitive)
-                      echo "   Error: $(head -1 "$clone_error" | sed 's/.*github.com/github.com/' | cut -d: -f1-2)"
-                      rm -f "$clone_error"
                       rm -rf "$temp_dir"
                       return 1
                     fi
-                    rm -f "$clone_error"
                     
-                    # Create archive (without changing directory)
+                    # Create archive
                     local archive_name="${repo_name}_${DATE_PREFIX}.zip"
                     local archive_path="$temp_dir/$archive_name"
                     
-                    if ! (cd "$temp_dir" && zip -qr "$archive_name" "$repo_name"); then
-                      echo "❌ Failed to archive: $repo_name"
+                    (cd "$temp_dir" && zip -qr "$archive_name" "$repo_name")
+                    
+                    if [ ! -f "$archive_path" ]; then
+                      echo "❌ Failed to create archive: $repo_name"
                       rm -rf "$temp_dir"
                       return 1
                     fi
                     
-                    # Upload to Azure
+                    # Upload to Azure with stdin redirected
                     if ! az storage blob upload \
                       --account-name "$AZURE_STORAGE_ACCOUNT" \
                       --account-key "$AZURE_STORAGE_KEY" \
@@ -111,24 +167,36 @@ jobs:
                       --name "$archive_name" \
                       --file "$archive_path" \
                       --overwrite \
-                      --output none 2>/dev/null; then
+                      --output none </dev/null 2>/dev/null; then
                       echo "❌ Failed to upload: $repo_name"
                       rm -rf "$temp_dir"
                       return 1
                     fi
                     
                     echo "✅ Successfully backed up: $repo_name"
-                    cd "$current_dir"  # Ensure we're back in a valid directory
                     rm -rf "$temp_dir"
                     return 0
                   }
 
-                  # Process each repository
-                  while IFS= read -r repo_url; do
+                  # Read all repositories into an array first
+                  echo "📋 Reading repository list..."
+                  declare -a REPOS_ARRAY
+
+                  while IFS= read -r line; do
                     # Skip comments and empty lines
-                    if [[ "$repo_url" =~ ^[[:space:]]*# ]] || [[ -z "${repo_url// }" ]]; then
-                      continue
+                    if [[ ! "$line" =~ ^[[:space:]]*# ]] && [[ -n "${line// }" ]]; then
+                      REPOS_ARRAY+=("$line")
                     fi
+                  done < repos.txt
+
+                  TOTAL_REPOS=${#REPOS_ARRAY[@]}
+                  echo "📋 Found $TOTAL_REPOS repositories to backup"
+                  echo ""
+
+                  # Process each repository from the array
+                  for i in "${!REPOS_ARRAY[@]}"; do
+                    repo_url="${REPOS_ARRAY[$i]}"
+                    echo "[$(($i + 1))/$TOTAL_REPOS] Processing..."
                     
                     if backup_repo "$repo_url"; then
                       SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
@@ -136,7 +204,8 @@ jobs:
                       FAIL_COUNT=$((FAIL_COUNT + 1))
                       FAILED_REPOS="${FAILED_REPOS}$(basename "$repo_url" .git), "
                     fi
-                  done < repos.txt
+                    echo ""
+                  done
 
                   # Clean up old backups
                   echo "🧹 Cleaning up old backups..."
@@ -159,12 +228,21 @@ jobs:
                     fi
                   done
 
+                  # Final summary
+                  echo ""
+                  echo "📊 Final Summary:"
+                  echo "  Total repositories: $TOTAL_REPOS"
+                  echo "  Successfully backed up: $SUCCESS_COUNT"
+                  echo "  Failed: $FAIL_COUNT"
+
                   # Send webhook notification
                   if [ $FAIL_COUNT -eq 0 ]; then
-                    send_webhook true "Backup successful: $SUCCESS_COUNT repositories backed up"
-                    echo "✅ Backup completed successfully: $SUCCESS_COUNT repositories"
+                    send_webhook true "Backup successful: All $SUCCESS_COUNT repositories backed up"
+                    echo ""
+                    echo "✅ Backup completed successfully!"
                   else
                     send_webhook false "Backup completed with errors: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed (${FAILED_REPOS%, })"
+                    echo ""
                     echo "⚠️ Backup completed with $FAIL_COUNT failures"
                     exit 1
                   fi
