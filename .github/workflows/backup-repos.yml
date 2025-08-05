@@ -123,49 +123,107 @@ jobs:
 
             - name: Setup Azure CLI
               run: |
-                  # Test Azure connection and credentials
+                  set -euo pipefail
+
+                  # Enhanced logging function
                   log() {
                     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${*:2}"
                   }
 
-                  log "INFO" "Testing Azure CLI authentication..."
+                  log "INFO" "🔐 Testing Azure CLI authentication..."
 
-                  if ! az storage account show \
-                    --name "$AZURE_STORAGE_ACCOUNT" \
-                    --account-key "$AZURE_STORAGE_KEY" \
-                    --query "name" \
-                    --output tsv; then
-                    log "ERROR" "Failed to authenticate with Azure storage account: $AZURE_STORAGE_ACCOUNT"
-                    log "ERROR" "Please verify AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_KEY secrets"
+                  # Validate secret format (basic checks)
+                  if [ -z "$AZURE_STORAGE_ACCOUNT" ]; then
+                    log "ERROR" "AZURE_STORAGE_ACCOUNT is empty"
                     exit 1
                   fi
 
-                  log "INFO" "Azure authentication successful"
+                  if [ -z "$AZURE_STORAGE_KEY" ]; then
+                    log "ERROR" "AZURE_STORAGE_KEY is empty"
+                    exit 1
+                  fi
 
-                  # Create container if it doesn't exist
-                  log "INFO" "Ensuring backup container exists: $CONTAINER_NAME"
+                  # Check storage account name format
+                  if [[ ! "$AZURE_STORAGE_ACCOUNT" =~ ^[a-z0-9]{3,24}$ ]]; then
+                    log "WARN" "Storage account name format may be invalid (should be 3-24 lowercase letters/numbers)"
+                  fi
 
-                  if az storage container exists \
+                  log "INFO" "Storage account: $AZURE_STORAGE_ACCOUNT"
+                  log "INFO" "Storage key length: ${#AZURE_STORAGE_KEY} characters"
+
+                  # Test 1: Simple container list (most reliable test)
+                  log "INFO" "Test 1: Listing containers to verify authentication..."
+
+                  if az storage container list \
+                    --account-name "$AZURE_STORAGE_ACCOUNT" \
+                    --account-key "$AZURE_STORAGE_KEY" \
+                    --output table 2>&1; then
+                    log "INFO" "✅ Container list successful - authentication working"
+                  else
+                    log "ERROR" "❌ Container list failed. Let's try more detailed diagnosis..."
+                    
+                    # Test 2: Try without account key to see if it's a key issue
+                    log "INFO" "Test 2: Testing account name resolution..."
+                    if az storage account show --name "$AZURE_STORAGE_ACCOUNT" --output table 2>&1; then
+                      log "ERROR" "Storage account exists but key authentication failed"
+                      log "ERROR" "Possible issues:"
+                      log "ERROR" "  1. Storage key is incorrect or expired"
+                      log "ERROR" "  2. Storage key has special characters causing parsing issues"
+                      log "ERROR" "  3. Storage account has restricted access policies"
+                    else
+                      log "ERROR" "Cannot access storage account information"
+                      log "ERROR" "Possible issues:"
+                      log "ERROR" "  1. Storage account name is incorrect"
+                      log "ERROR" "  2. Storage account is in different subscription/region"
+                      log "ERROR" "  3. Storage account does not exist"
+                      log "ERROR" "  4. Insufficient permissions to read account metadata"
+                    fi
+                    
+                    # Test 3: Show detailed Azure CLI error
+                    log "INFO" "Test 3: Detailed error output..."
+                    az storage container list \
+                      --account-name "$AZURE_STORAGE_ACCOUNT" \
+                      --account-key "$AZURE_STORAGE_KEY" \
+                      --output json \
+                      --debug 2>&1 | head -20 || true
+                      
+                    exit 1
+                  fi
+
+                  # Create/verify container
+                  log "INFO" "📦 Ensuring backup container exists: $CONTAINER_NAME"
+
+                  # Check if container exists
+                  container_exists=$(az storage container exists \
                     --account-name "$AZURE_STORAGE_ACCOUNT" \
                     --account-key "$AZURE_STORAGE_KEY" \
                     --name "$CONTAINER_NAME" \
                     --query "exists" \
-                    --output tsv | grep -q "true"; then
-                    log "INFO" "Container '$CONTAINER_NAME' already exists"
+                    --output tsv 2>/dev/null || echo "false")
+
+                  if [ "$container_exists" = "true" ]; then
+                    log "INFO" "✅ Container '$CONTAINER_NAME' already exists"
                   else
-                    log "INFO" "Creating container '$CONTAINER_NAME'"
+                    log "INFO" "📁 Creating container '$CONTAINER_NAME'..."
                     if az storage container create \
                       --account-name "$AZURE_STORAGE_ACCOUNT" \
                       --account-key "$AZURE_STORAGE_KEY" \
                       --name "$CONTAINER_NAME" \
                       --public-access off \
-                      --output none; then
-                      log "INFO" "Container created successfully"
+                      --output none 2>&1; then
+                      log "INFO" "✅ Container created successfully"
                     else
-                      log "ERROR" "Failed to create container '$CONTAINER_NAME'"
+                      log "ERROR" "❌ Failed to create container. Error details:"
+                      az storage container create \
+                        --account-name "$AZURE_STORAGE_ACCOUNT" \
+                        --account-key "$AZURE_STORAGE_KEY" \
+                        --name "$CONTAINER_NAME" \
+                        --public-access off 2>&1 || true
                       exit 1
                     fi
                   fi
+
+                  log "INFO" "🎉 Azure CLI setup completed successfully"
 
             - name: Backup repositories
               run: |
@@ -360,7 +418,6 @@ jobs:
                     log "INFO" "Testing Azure connection..."
                     if ! az storage account show \
                       --name "$AZURE_STORAGE_ACCOUNT" \
-                      --account-key "$AZURE_STORAGE_KEY" \
                       --query "name" \
                       --output tsv >/dev/null 2>&1; then
                       log "ERROR" "Cannot access Azure storage account: $AZURE_STORAGE_ACCOUNT"
