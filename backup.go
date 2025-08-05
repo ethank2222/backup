@@ -338,34 +338,17 @@ func backupRepo(repoURL, repoName, backupDir string) Result {
 	
 	start := time.Now()
 	
-	// Check if repository is accessible
-	if err := checkRepositoryAccess(repoURL); err != nil {
-		return Result{
-			Repo:    repoURL,
-			Success: false,
-			Error:   fmt.Sprintf("Repository access check failed: %v", err),
-		}
-	}
+
 	
 	// Construct authenticated URL
 	authURL := constructAuthenticatedURL(repoURL)
 	
-	// Log the authentication status (without exposing the token)
+	// Log authentication status
 	token := os.Getenv("BACKUP_TOKEN")
 	if token == "" {
 		logger.Warn("No BACKUP_TOKEN found, using unauthenticated access", "repo", repoName)
 	} else {
-		logger.Info("Using authenticated access", "repo", repoName, "tokenLength", len(token))
-		
-		// Test the token format
-		if len(token) < 20 {
-			logger.Warn("Token seems too short", "repo", repoName, "tokenLength", len(token))
-		}
-		
-		// Check if token contains any special characters that might cause issues
-		if strings.ContainsAny(token, " \t\n\r") {
-			logger.Warn("Token contains whitespace characters", "repo", repoName)
-		}
+		logger.Info("Using authenticated access", "repo", repoName)
 	}
 	
 	// Clone repository
@@ -423,56 +406,7 @@ func backupRepo(repoURL, repoName, backupDir string) Result {
 	}
 }
 
-func checkRepositoryAccess(repoURL string) error {
-	token := os.Getenv("BACKUP_TOKEN")
-	if token == "" {
-		// Without token, we can't check access, so we'll try anyway
-		return nil
-	}
-	
-	// Add small delay to respect rate limits
-	time.Sleep(100 * time.Millisecond)
-	
-	// Extract owner and repo from URL
-	repoURL = strings.TrimSuffix(repoURL, ".git")
-	parts := strings.Split(repoURL, "/")
-	if len(parts) < 2 {
-		return fmt.Errorf("invalid repository URL format")
-	}
-	
-	owner := sanitizePathComponent(parts[len(parts)-2])
-	repo := sanitizePathComponent(parts[len(parts)-1])
-	
-	// Check repository access via GitHub API
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo)
-	
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	
-	req, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
-	}
-	
-	req.Header.Set("Authorization", fmt.Sprintf("token %s", token))
-	req.Header.Set("Accept", "application/vnd.github.v3+json")
-	req.Header.Set("User-Agent", "GitHub-Backup-Tool/1.0")
-	
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to check repository access: %v", err)
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode == 404 {
-		return fmt.Errorf("repository not found or access denied")
-	} else if resp.StatusCode != 200 {
-		return fmt.Errorf("repository access check failed with status: %d", resp.StatusCode)
-	}
-	
-	return nil
-}
+
 
 func constructAuthenticatedURL(repoURL string) string {
 	token := os.Getenv("BACKUP_TOKEN")
@@ -482,24 +416,13 @@ func constructAuthenticatedURL(repoURL string) string {
 	
 	// For GitHub, we need to use the token as the username
 	// The format should be: https://token@github.com/owner/repo.git
-	// But we need to handle the case where the URL might not end with .git
 	repoURL = strings.TrimSuffix(repoURL, ".git")
 	
 	// Ensure the token doesn't have any extra characters
 	token = strings.TrimSpace(token)
 	
-	// Validate token format (GitHub tokens are typically 40+ characters)
-	if len(token) < 20 {
-		logger.Warn("Token seems too short, may be invalid", "tokenLength", len(token))
-	}
-	
 	// Construct the authenticated URL
-	authURL := strings.Replace(repoURL, "https://github.com/", fmt.Sprintf("https://%s@github.com/", token), 1)
-	
-	// Log the URL format (without exposing the token)
-	logger.Debug("Constructed authenticated URL", "originalURL", repoURL, "authURLFormat", strings.Replace(authURL, token, "[TOKEN]", 1))
-	
-	return authURL
+	return strings.Replace(repoURL, "https://github.com/", fmt.Sprintf("https://%s@github.com/", token), 1)
 }
 
 func cloneRepository(repoURL, backupDir string) error {
@@ -734,16 +657,16 @@ func sendNotification(status, message string, successfulRepos []string) {
 	var title, color string
 	switch status {
 	case "success":
-		title = "✅ GitHub Backup Successful"
+		title = "GitHub Backup Successful"
 		color = "Good"
 	case "failure":
-		title = "❌ GitHub Backup Failed"
+		title = "GitHub Backup Failed"
 		color = "Attention"
 	case "panic":
-		title = "💥 GitHub Backup Crashed"
+		title = "GitHub Backup Crashed"
 		color = "Attention"
 	default:
-		title = "⚠️ GitHub Backup Status"
+		title = "GitHub Backup Status"
 		color = "Warning"
 	}
 	

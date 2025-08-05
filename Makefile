@@ -29,7 +29,7 @@ build: ## Build the backup binary
 	@echo "Building $(APP_NAME)..."
 	@mkdir -p $(BUILD_DIR)
 	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(APP_NAME) backup.go
-	@echo "✅ Build complete: $(BUILD_DIR)/$(APP_NAME)"
+	@echo "Build complete: $(BUILD_DIR)/$(APP_NAME)"
 
 .PHONY: build-all
 build-all: ## Build for all platforms
@@ -38,26 +38,26 @@ build-all: ## Build for all platforms
 	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(APP_NAME)-linux backup.go
 	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(APP_NAME)-windows.exe backup.go
 	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(APP_NAME)-darwin backup.go
-	@echo "✅ Cross-platform builds complete"
+	@echo "Cross-platform builds complete"
 
 .PHONY: clean
 clean: ## Clean build artifacts
 	@echo "Cleaning build artifacts..."
 	$(GOCLEAN)
 	@rm -rf $(BUILD_DIR)
-	@echo "✅ Clean complete"
+	@echo "Clean complete"
 
 .PHONY: test
 test: ## Run tests
 	@echo "Running tests..."
 	$(GOTEST) -v ./...
-	@echo "✅ Tests complete"
+	@echo "Tests complete"
 
 .PHONY: run
 run: ## Run the backup system
 	@echo "Running backup system..."
 	@if [ -z "$(BACKUP_TOKEN)" ]; then \
-		echo "⚠️  Warning: BACKUP_TOKEN not set"; \
+		echo "Warning: BACKUP_TOKEN not set"; \
 	fi
 	$(GORUN) backup.go
 
@@ -65,30 +65,30 @@ run: ## Run the backup system
 validate: ## Validate configuration and environment
 	@echo "Validating configuration..."
 	@if [ ! -f repositories.txt ]; then \
-		echo "❌ Error: repositories.txt not found"; \
+		echo "Error: repositories.txt not found"; \
 		exit 1; \
 	fi
 	@if [ -z "$(BACKUP_TOKEN)" ]; then \
-		echo "❌ Error: BACKUP_TOKEN not set"; \
+		echo "Error: BACKUP_TOKEN not set"; \
 		exit 1; \
 	fi
 	@if [ -z "$(GITHUB_REPOSITORY)" ]; then \
-		echo "❌ Error: GITHUB_REPOSITORY not set"; \
+		echo "Error: GITHUB_REPOSITORY not set"; \
 		exit 1; \
 	fi
-	@echo "✅ Configuration validated"
+	@echo "Configuration validated"
 
 .PHONY: fmt
 fmt: ## Format code
 	@echo "Formatting code..."
 	$(GOCMD) fmt ./...
-	@echo "✅ Code formatted"
+	@echo "Code formatted"
 
 .PHONY: vet
 vet: ## Vet code
 	@echo "Vetting code..."
 	$(GOCMD) vet ./...
-	@echo "✅ Code vetted"
+	@echo "Code vetted"
 
 .PHONY: check
 check: fmt vet test ## Run all code quality checks
@@ -97,13 +97,13 @@ check: fmt vet test ## Run all code quality checks
 docker-build: ## Build Docker image
 	@echo "Building Docker image..."
 	docker build -t github-backup:latest .
-	@echo "✅ Docker image built"
+	@echo "Docker image built"
 
 .PHONY: docker-run
 docker-run: ## Run Docker container
 	@echo "Running Docker container..."
 	@if [ -z "$(BACKUP_TOKEN)" ]; then \
-		echo "❌ Error: BACKUP_TOKEN not set"; \
+		echo "Error: BACKUP_TOKEN not set"; \
 		exit 1; \
 	fi
 	docker run --rm \
@@ -117,14 +117,14 @@ release: clean build-all ## Create release package
 	@echo "Creating release package..."
 	@mkdir -p release
 	@cp $(BUILD_DIR)/* release/
-	@cp repositories.txt release/ 2>/dev/null || echo "⚠️  repositories.txt not found"
+	@cp repositories.txt release/ 2>/dev/null || echo "repositories.txt not found"
 	@cp README.md release/
-	@echo "✅ Release files created in release/"
+	@echo "Release files created in release/"
 
 .PHONY: production
 production: validate check build ## Production build with validation
-	@echo "✅ Production build complete"
+	@echo "Production build complete"
 
 .PHONY: quick
 quick: build run ## Quick build and run
-	@echo "✅ Quick build and run complete" 
+	@echo "Quick build and run complete" 
