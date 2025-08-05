@@ -61,7 +61,7 @@ If you want webhook notifications, set the `WEBHOOK_URL` secret to your webhook 
         "backed_up_repos": [
             {
                 "repo": "https://github.com/username/repo1.git",
-                "blob_name": "repo1_20240115.tar.gz"
+                "blob_name": "repo1_20240115.zip"
             }
         ]
     }
@@ -107,7 +107,7 @@ If you want webhook notifications, set the `WEBHOOK_URL` secret to your webhook 
 ### Storage Structure
 
 -   **Container**: `repo-backups`
--   **Blob Names**: `{repo-name}_{YYYYMMDD}.tar.gz` (e.g., `TrinityAI_20240115.tar.gz`)
+-   **Blob Names**: `{repo-name}_{YYYYMMDD}.zip` (e.g., `TrinityAI_20240115.zip`)
 -   **Metadata**: Includes backup date and TTL information
 
 ## Security Considerations

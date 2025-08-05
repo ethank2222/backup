@@ -1,733 +1,1074 @@
-name: Repository Backup to Azure Blob Storage
+# Simplified upload with step-by-step debugging
+          upload_to_blob_storage() {
+            local repo_path="$1"
+            local blob_name="$2"
+            local repo_name=$(basename "$repo_path")
+            
+            log "INFO" "🔍 UPLOAD DEBUG - Starting process for $repo_name"
+            
+            # Step 1: Path validation
+            if [ ! -d "$repo_path" ]; then
+              log "ERROR" "❌ Repository path missing: $repo_path"
+              return 1
+            fi
+            log "INFO" "✅ Step 1: Repository path exists"
+            
+            # Step 2: Size calculation
+            local repo_size=$(du -sb "$repo_path" 2>/dev/null | cut -f1)
+            if [ -z "$repo_size" ] || [ "$repo_size" -eq 0 ]; then
+              log "ERROR" "❌ Repository size is 0 or cannot be determined"
+              log "INFO" "Directory contents:"
+              ls -la "$repo_path" 2>/dev/null || log "ERROR" "Cannot list directory"
+              return 1
+            fi
+            log "INFO" "✅ Step 2: Repository size: $(numfmt --to=iec $repo_size 2>/dev/null || echo "${repo_size} bytes")"
+            
+            # Step 3: Archive creation
+            local zip_path="${repo_path}.zip"
+            log "INFO" "📦 Step 3: Creating archive $zip_path"
+            
+            if ! zip -r "$zip_path" "$repo_path" >/dev/null 2>&1; then
+              log "ERROR" "❌ Archive creation failed"
+              return 1
+            fi
+            
+            if [ ! -f "$zip_path" ]; then
+              log "ERROR" "❌ Archive file not created"
+              return 1
+            fi
+            
+            local archive_size=$(stat -c%s "$zip_path" 2>/dev/null)
+            if [ -z "$archive_size" ] || [ "$archive_size" -eq 0 ]; then
+              log "ERROR" "❌ Archive is empty"
+              rm -f "$zip_path"
+              return 1
+            fi
+            
+            log "INFO" "✅ Step 3: Archive created - $(numfmt --to=iec $archive_size 2>/dev/null || echo "${archive_size} bytes")"
+            
+            # Step 4: Upload to Azure
+            log "INFO" "☁️ Step 4: Uploading to Azure..."
+            local upload_start=$(date +%s)
+            
+            # Simple upload without complex error handling first
+            local upload_error_file=$(mktemp)
+            if az storage blob upload \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --account-key "$AZURE_STORAGE_KEY" \
+              --container-name "$CONTAINER_NAME" \
+              --name "$blob_name" \
+              --file "$zip_path" \
+              --overwrite \
+              --content-type "application/zip" \
+              --output json 2>"$upload_error_file"; then
+              
+              log "INFO" "✅ Step 4: Upload command succeeded"
+            else
+              local upload_error=$(cat "$upload_error_file" 2>/dev/null || echo "Unknown upload error")
+              log "ERROR" "❌ Step 4: Upload failed"
+              log "ERROR" "Upload error: $upload_error"
+              rm -f "$zip_path" "$upload_error_file"
+              return 1
+            fi
+            rm -f "$upload_error_file"
+            
+            local upload_duration=$(($(date +%s) - upload_start))
+            log "INFO" "⏱️ Upload took ${upload_duration}s"
+            
+            # Step 5: Verification
+            log "INFO" "🔍 Step 5: Verifying upload..."
+            if az storage blob exists \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --account-key "$AZURE_STORAGE_KEY" \
+              --container-name "$CONTAINER_NAME" \
+              --name "$blob_name" \
+              --output json 2>/dev/null | jq -r '.exists' | grep -q "true"; then
+              
+              log "INFO" "✅ Step 5: Upload verified successfully"
+              rm -f "$zip_path"
+              echo "$repo_size,$archive_size,$upload_duration"
+              return 0
+            else
+              log "ERROR" "❌ Step 5: Verification failed"
+              rm -f "$zip_path"
+              return 1
+            fi
+          }name: Repository Backup to Azure Blob Storage
 
 on:
-    workflow_dispatch:
-        inputs:
-            force_cleanup:
-                description: "Force cleanup of old backups"
-                required: false
-                default: false
-                type: boolean
-            retention_days:
-                description: "Retention period in days (default: 30)"
-                required: false
-                default: "30"
-                type: string
-    schedule:
-        - cron: "0 2 * * *" # Daily at 2:00 AM UTC
+  workflow_dispatch:
+    inputs:
+      force_cleanup:
+        description: 'Force cleanup of old backups'
+        required: false
+        default: false
+        type: boolean
+      retention_days:
+        description: 'Retention period in days (default: 30)'
+        required: false
+        default: '30'
+        type: string
+  schedule:
+    - cron: "0 2 * * *" # Daily at 2:00 AM UTC
 
 env:
-    AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
-    AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
-    WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-    BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
-    CONTAINER_NAME: "repo-backups"
-    MAX_RETRIES: 3
-    RETRY_DELAY: 30
-    RETENTION_DAYS: ${{ github.event.inputs.retention_days || '30' }}
+  AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+  AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+  WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+  BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+  CONTAINER_NAME: "repo-backups"
+  MAX_RETRIES: 3
+  RETRY_DELAY: 30
+  RETENTION_DAYS: ${{ github.event.inputs.retention_days || '30' }}
 
 jobs:
-    validate-config:
-        runs-on: ubuntu-latest
-        outputs:
-            config-valid: ${{ steps.validate.outputs.valid }}
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
+  validate-config:
+    runs-on: ubuntu-latest
+    outputs:
+      config-valid: ${{ steps.validate.outputs.valid }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-            - name: Validate configuration
-              id: validate
-              run: |
-                  echo "Validating backup configuration..."
+      - name: Validate configuration
+        id: validate
+        run: |
+          echo "Validating backup configuration..."
+          
+          # Check required secrets
+          if [ -z "$AZURE_STORAGE_ACCOUNT" ]; then
+            echo "❌ AZURE_STORAGE_ACCOUNT secret is missing"
+            exit 1
+          fi
+          
+          if [ -z "$AZURE_STORAGE_KEY" ]; then
+            echo "❌ AZURE_STORAGE_KEY secret is missing"
+            exit 1
+          fi
+          
+          # Check repos.txt exists and is valid
+          if [ ! -f "repos.txt" ]; then
+            echo "❌ repos.txt file not found"
+            exit 1
+          fi
+          
+          # Validate repository URLs
+          invalid_repos=0
+          while IFS= read -r line; do
+            # Skip comments and empty lines
+            if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "${line// }" ]]; then
+              continue
+            fi
+            
+            # Basic URL validation
+            if [[ ! "$line" =~ ^https?:// ]]; then
+              echo "❌ Invalid repository URL: $line"
+              invalid_repos=$((invalid_repos + 1))
+            fi
+          done < repos.txt
+          
+          if [ $invalid_repos -gt 0 ]; then
+            echo "❌ Found $invalid_repos invalid repository URLs"
+            exit 1
+          fi
+          
+          # Count valid repositories
+          repo_count=$(grep -v '^[[:space:]]*#' repos.txt | grep -v '^[[:space:]]*$' | wc -l)
+          echo "✅ Configuration valid. Found $repo_count repositories to backup."
+          echo "valid=true" >> $GITHUB_OUTPUT
 
-                  # Check required secrets
-                  if [ -z "$AZURE_STORAGE_ACCOUNT" ]; then
-                    echo "❌ AZURE_STORAGE_ACCOUNT secret is missing"
-                    exit 1
-                  fi
+  backup-repositories:
+    runs-on: ubuntu-latest
+    needs: validate-config
+    if: needs.validate-config.outputs.config-valid == 'true'
+    timeout-minutes: 480 # 8 hours max
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-                  if [ -z "$AZURE_STORAGE_KEY" ]; then
-                    echo "❌ AZURE_STORAGE_KEY secret is missing"
-                    exit 1
-                  fi
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          
+          echo "📦 Installing Azure CLI..."
+          if ! curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash; then
+            echo "❌ Failed to install Azure CLI"
+            exit 1
+          fi
+          
+          echo "📦 Installing additional tools..."
+          if ! sudo apt-get update; then
+            echo "❌ Failed to update package list"
+            exit 1
+          fi
+          
+          if ! sudo apt-get install -y jq curl parallel bc; then
+            echo "❌ Failed to install required packages"
+            exit 1
+          fi
+          
+          # Verify installations
+          echo "✅ Verifying installations..."
+          az --version | head -1
+          jq --version
+          bc --version | head -1
+          
+          echo "✅ All dependencies installed successfully"
 
-                  # Check repos.txt exists and is valid
-                  if [ ! -f "repos.txt" ]; then
-                    echo "❌ repos.txt file not found"
-                    exit 1
-                  fi
+      - name: Setup Azure CLI
+        run: |
+          set -euo pipefail
+          
+          # Enhanced logging function
+          log() {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${*:2}"
+          }
+          
+          log "INFO" "🔐 Testing Azure CLI authentication..."
+          
+          # Validate secret format (basic checks)
+          if [ -z "$AZURE_STORAGE_ACCOUNT" ]; then
+            log "ERROR" "AZURE_STORAGE_ACCOUNT is empty"
+            exit 1
+          fi
+          
+          if [ -z "$AZURE_STORAGE_KEY" ]; then
+            log "ERROR" "AZURE_STORAGE_KEY is empty"
+            exit 1
+          fi
+          
+          # Check storage account name format
+          if [[ ! "$AZURE_STORAGE_ACCOUNT" =~ ^[a-z0-9]{3,24}$ ]]; then
+            log "WARN" "Storage account name format may be invalid (should be 3-24 lowercase letters/numbers)"
+          fi
+          
+          log "INFO" "Storage account: $AZURE_STORAGE_ACCOUNT"
+          log "INFO" "Storage key length: ${#AZURE_STORAGE_KEY} characters"
+          
+          # Test 1: Simple container list (most reliable test)
+          log "INFO" "Test 1: Listing containers to verify authentication..."
+          
+          if az storage container list \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --account-key "$AZURE_STORAGE_KEY" \
+            --output table 2>&1; then
+            log "INFO" "✅ Container list successful - authentication working"
+          else
+            log "ERROR" "❌ Container list failed. Let's try more detailed diagnosis..."
+            
+            # Test 2: Try without account key to see if it's a key issue
+            log "INFO" "Test 2: Testing account name resolution..."
+            if az storage account show --name "$AZURE_STORAGE_ACCOUNT" --output table 2>&1; then
+              log "ERROR" "Storage account exists but key authentication failed"
+              log "ERROR" "Possible issues:"
+              log "ERROR" "  1. Storage key is incorrect or expired"
+              log "ERROR" "  2. Storage key has special characters causing parsing issues"
+              log "ERROR" "  3. Storage account has restricted access policies"
+            else
+              log "ERROR" "Cannot access storage account information"
+              log "ERROR" "Possible issues:"
+              log "ERROR" "  1. Storage account name is incorrect"
+              log "ERROR" "  2. Storage account is in different subscription/region"
+              log "ERROR" "  3. Storage account does not exist"
+              log "ERROR" "  4. Insufficient permissions to read account metadata"
+            fi
+            
+            # Test 3: Show detailed Azure CLI error
+            log "INFO" "Test 3: Detailed error output..."
+            az storage container list \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --account-key "$AZURE_STORAGE_KEY" \
+              --output json \
+              --debug 2>&1 | head -20 || true
+              
+            exit 1
+          fi
+          
+          # Create/verify container
+          log "INFO" "📦 Ensuring backup container exists: $CONTAINER_NAME"
+          
+          # Check if container exists
+          container_exists=$(az storage container exists \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --account-key "$AZURE_STORAGE_KEY" \
+            --name "$CONTAINER_NAME" \
+            --query "exists" \
+            --output tsv 2>/dev/null || echo "false")
+          
+          if [ "$container_exists" = "true" ]; then
+            log "INFO" "✅ Container '$CONTAINER_NAME' already exists"
+          else
+            log "INFO" "📁 Creating container '$CONTAINER_NAME'..."
+            if az storage container create \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --account-key "$AZURE_STORAGE_KEY" \
+              --name "$CONTAINER_NAME" \
+              --public-access off \
+              --output none 2>&1; then
+              log "INFO" "✅ Container created successfully"
+            else
+              log "ERROR" "❌ Failed to create container. Error details:"
+              az storage container create \
+                --account-name "$AZURE_STORAGE_ACCOUNT" \
+                --account-key "$AZURE_STORAGE_KEY" \
+                --name "$CONTAINER_NAME" \
+                --public-access off 2>&1 || true
+              exit 1
+            fi
+          fi
+          
+          log "INFO" "🎉 Azure CLI setup completed successfully"
 
-                  # Validate repository URLs
-                  invalid_repos=0
-                  while IFS= read -r line; do
-                    # Skip comments and empty lines
-                    if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "${line// }" ]]; then
-                      continue
-                    fi
+      - name: Backup repositories
+        run: |
+          set -euo pipefail
+          
+          # Global variables
+          DATE_STR=$(date +%Y%m%d_%H%M%S)
+          TEMP_BASE_DIR=$(mktemp -d)
+          SUCCESSFUL_BACKUPS=()
+          FAILED_BACKUPS=()
+          BACKUP_STATS=""
+          
+          # Cleanup on exit
+          trap 'cleanup_and_exit' EXIT
+          
+          cleanup_and_exit() {
+            echo "🧹 Cleaning up temporary files..."
+            rm -rf "$TEMP_BASE_DIR"
+          }
+          
+          # Enhanced logging function
+          log() {
+            local level="$1"
+            shift
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*"
+          }
+          
+          # Retry function with exponential backoff (simplified)
+          retry_command() {
+            local max_attempts="$1"
+            local delay="$2"
+            shift 2
+            local attempt=1
+            
+            while [ $attempt -le $max_attempts ]; do
+              log "INFO" "Executing command (attempt $attempt of $max_attempts)"
+              
+              if "$@"; then
+                return 0
+              else
+                if [ $attempt -eq $max_attempts ]; then
+                  log "ERROR" "Command failed after $max_attempts attempts"
+                  return 1
+                fi
+                
+                local wait_time=$((delay * attempt))
+                log "WARN" "Command failed, retrying in ${wait_time}s..."
+                sleep $wait_time
+                attempt=$((attempt + 1))
+              fi
+            done
+          }
+          
+          # Enhanced webhook function with retry
+          send_webhook() {
+            local success="$1"
+            local message="$2"
+            local details="$3"
+            
+            if [ -z "$WEBHOOK_URL" ]; then
+              log "INFO" "No webhook URL configured, skipping notification"
+              return 0
+            fi
+            
+            # Sanitize message for JSON
+            local safe_message=$(echo "$message" | jq -Rs .)
+            
+            local payload=$(jq -n \
+              --argjson success "$success" \
+              --argjson message "$safe_message" \
+              --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+              --arg workflow "repository-backup" \
+              --argjson details "$details" \
+              '{
+                success: $success,
+                message: $message,
+                timestamp: $timestamp,
+                workflow: $workflow,
+                details: $details
+              }')
+            
+            log "INFO" "Sending webhook notification..."
+            
+            local response_file=$(mktemp)
+            local http_code
+            
+            http_code=$(curl -s -w "%{http_code}" \
+              -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -H "User-Agent: GitHub-Actions-Backup/1.0" \
+              -d "$payload" \
+              --max-time 30 \
+              --connect-timeout 10 \
+              --retry 2 \
+              --retry-delay 5 \
+              -o "$response_file")
+            
+            if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+              log "INFO" "Webhook sent successfully (HTTP $http_code)"
+            else
+              log "ERROR" "Webhook failed (HTTP $http_code): $(cat "$response_file")"
+            fi
+            
+            rm -f "$response_file"
+          }
+          
+          # Enhanced repository cloning with authentication diagnostics
+          clone_repository() {
+            local repo_url="$1"
+            local temp_dir="$2"
+            local repo_name=$(basename "$repo_url" .git)
+            local repo_path="$temp_dir/${repo_name}_${DATE_STR}"
+            
+            log "INFO" "🔄 Starting clone process for: $repo_name"
+            log "INFO" "📍 Source URL: $repo_url"
+            log "INFO" "📁 Target path: $repo_path"
+            
+            # Check if BACKUP_TOKEN is available
+            if [ -n "$BACKUP_TOKEN" ]; then
+              log "INFO" "🔑 BACKUP_TOKEN is available (${#BACKUP_TOKEN} characters)"
+            else
+              log "WARN" "⚠️ No BACKUP_TOKEN provided - will attempt public access"
+            fi
+            
+            # Prepare authenticated clone URL
+            local clone_url="$repo_url"
+            if [ -n "$BACKUP_TOKEN" ] && [[ "$repo_url" == *"github.com"* ]]; then
+              clone_url="https://${BACKUP_TOKEN}@$(echo "$repo_url" | sed 's|https://||')"
+              log "INFO" "🔐 Using authenticated clone URL"
+              log "INFO" "🔍 Token length: ${#BACKUP_TOKEN} characters"
+              log "INFO" "🔍 URL format: https://[TOKEN]@github.com/owner/repo.git"
+            else
+              log "INFO" "🌐 Using public clone URL"
+            fi
+            
+            # Test repository accessibility first
+            log "INFO" "🧪 Testing repository accessibility..."
+            local test_error_file=$(mktemp)
+            
+            if git ls-remote "$clone_url" HEAD 2>"$test_error_file" >/dev/null; then
+              log "INFO" "✅ Repository is accessible - proceeding with clone"
+              local remote_refs=$(git ls-remote "$clone_url" 2>/dev/null | wc -l)
+              log "INFO" "📊 Remote repository has $remote_refs references"
+            else
+              local access_error=$(cat "$test_error_file" 2>/dev/null || echo "Unknown access error")
+              log "ERROR" "❌ Repository accessibility test failed"
+              log "ERROR" "Access error: $access_error"
+              
+              # Diagnose specific issues
+              if [[ "$access_error" == *"Authentication failed"* ]] || [[ "$access_error" == *"403"* ]]; then
+                log "ERROR" "🔒 Authentication failed - possible issues:"
+                log "ERROR" "  - Repository is private and BACKUP_TOKEN lacks access"
+                log "ERROR" "  - Token doesn't have 'repo' scope permissions"
+                log "ERROR" "  - Token is expired or invalid"
+              elif [[ "$access_error" == *"Repository not found"* ]] || [[ "$access_error" == *"404"* ]]; then
+                log "ERROR" "🔍 Repository not found - possible issues:"
+                log "ERROR" "  - Repository name or owner is incorrect"
+                log "ERROR" "  - Repository was deleted or moved"
+                log "ERROR" "  - You don't have access to this private repository"
+              elif [[ "$access_error" == *"Connection"* ]] || [[ "$access_error" == *"timeout"* ]]; then
+                log "ERROR" "🌐 Network connectivity issue"
+              fi
+              
+              rm -f "$test_error_file"
+              return 1
+            fi
+            rm -f "$test_error_file"
+            
+            # Attempt mirror clone first
+            log "INFO" "🪞 Attempting mirror clone..."
+            local clone_error_file=$(mktemp)
+            
+            if git clone --mirror "$clone_url" "$repo_path" 2>"$clone_error_file"; then
+              log "INFO" "✅ Mirror clone completed"
+              
+              # Validate what we got
+              if [ -d "$repo_path" ]; then
+                local ref_count=0
+                local object_count=0
+                local size_bytes=0
+                
+                # Count refs
+                if [ -d "$repo_path/refs" ]; then
+                  ref_count=$(find "$repo_path/refs" -type f 2>/dev/null | wc -l)
+                fi
+                
+                # Count objects  
+                if [ -d "$repo_path/objects" ]; then
+                  object_count=$(find "$repo_path/objects" -name "[0-9a-f][0-9a-f]" -type d 2>/dev/null | wc -l)
+                fi
+                
+                # Calculate size
+                size_bytes=$(du -sb "$repo_path" 2>/dev/null | cut -f1 || echo "0")
+                
+                log "INFO" "📊 Mirror clone results:"
+                log "INFO" "  - References: $ref_count"
+                log "INFO" "  - Object directories: $object_count" 
+                log "INFO" "  - Total size: $(numfmt --to=iec $size_bytes 2>/dev/null || echo "${size_bytes} bytes")"
+                
+                # Check if mirror clone actually got content
+                if [ "$ref_count" -eq 0 ] && [ "$object_count" -eq 0 ]; then
+                  log "WARN" "⚠️ Mirror clone succeeded but got no content - trying regular clone"
+                  rm -rf "$repo_path"
+                  
+                  # Try regular clone as fallback
+                  log "INFO" "🔄 Attempting regular clone as fallback..."
+                  if git clone "$clone_url" "$repo_path" 2>"$clone_error_file"; then
+                    log "INFO" "✅ Complete clone successful"
                     
-                    # Basic URL validation
-                    if [[ ! "$line" =~ ^https?:// ]]; then
-                      echo "❌ Invalid repository URL: $line"
-                      invalid_repos=$((invalid_repos + 1))
-                    fi
-                  done < repos.txt
-
-                  if [ $invalid_repos -gt 0 ]; then
-                    echo "❌ Found $invalid_repos invalid repository URLs"
-                    exit 1
-                  fi
-
-                  # Count valid repositories
-                  repo_count=$(grep -v '^[[:space:]]*#' repos.txt | grep -v '^[[:space:]]*$' | wc -l)
-                  echo "✅ Configuration valid. Found $repo_count repositories to backup."
-                  echo "valid=true" >> $GITHUB_OUTPUT
-
-    backup-repositories:
-        runs-on: ubuntu-latest
-        needs: validate-config
-        if: needs.validate-config.outputs.config-valid == 'true'
-        timeout-minutes: 480 # 8 hours max
-
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
-
-            - name: Install dependencies
-              run: |
-                  set -euo pipefail
-
-                  echo "📦 Installing Azure CLI..."
-                  if ! curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash; then
-                    echo "❌ Failed to install Azure CLI"
-                    exit 1
-                  fi
-
-                  echo "📦 Installing additional tools..."
-                  if ! sudo apt-get update; then
-                    echo "❌ Failed to update package list"
-                    exit 1
-                  fi
-
-                  if ! sudo apt-get install -y jq curl parallel bc; then
-                    echo "❌ Failed to install required packages"
-                    exit 1
-                  fi
-
-                  # Verify installations
-                  echo "✅ Verifying installations..."
-                  az --version | head -1
-                  jq --version
-                  bc --version | head -1
-
-                  echo "✅ All dependencies installed successfully"
-
-            - name: Setup Azure CLI
-              run: |
-                  set -euo pipefail
-
-                  # Enhanced logging function
-                  log() {
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${*:2}"
-                  }
-
-                  log "INFO" "🔐 Testing Azure CLI authentication..."
-
-                  # Validate secret format (basic checks)
-                  if [ -z "$AZURE_STORAGE_ACCOUNT" ]; then
-                    log "ERROR" "AZURE_STORAGE_ACCOUNT is empty"
-                    exit 1
-                  fi
-
-                  if [ -z "$AZURE_STORAGE_KEY" ]; then
-                    log "ERROR" "AZURE_STORAGE_KEY is empty"
-                    exit 1
-                  fi
-
-                  # Check storage account name format
-                  if [[ ! "$AZURE_STORAGE_ACCOUNT" =~ ^[a-z0-9]{3,24}$ ]]; then
-                    log "WARN" "Storage account name format may be invalid (should be 3-24 lowercase letters/numbers)"
-                  fi
-
-                  log "INFO" "Storage account: $AZURE_STORAGE_ACCOUNT"
-                  log "INFO" "Storage key length: ${#AZURE_STORAGE_KEY} characters"
-
-                  # Test 1: Simple container list (most reliable test)
-                  log "INFO" "Test 1: Listing containers to verify authentication..."
-
-                  if az storage container list \
-                    --account-name "$AZURE_STORAGE_ACCOUNT" \
-                    --account-key "$AZURE_STORAGE_KEY" \
-                    --output table 2>&1; then
-                    log "INFO" "✅ Container list successful - authentication working"
-                  else
-                    log "ERROR" "❌ Container list failed. Let's try more detailed diagnosis..."
-                    
-                    # Test 2: Try without account key to see if it's a key issue
-                    log "INFO" "Test 2: Testing account name resolution..."
-                    if az storage account show --name "$AZURE_STORAGE_ACCOUNT" --output table 2>&1; then
-                      log "ERROR" "Storage account exists but key authentication failed"
-                      log "ERROR" "Possible issues:"
-                      log "ERROR" "  1. Storage key is incorrect or expired"
-                      log "ERROR" "  2. Storage key has special characters causing parsing issues"
-                      log "ERROR" "  3. Storage account has restricted access policies"
-                    else
-                      log "ERROR" "Cannot access storage account information"
-                      log "ERROR" "Possible issues:"
-                      log "ERROR" "  1. Storage account name is incorrect"
-                      log "ERROR" "  2. Storage account is in different subscription/region"
-                      log "ERROR" "  3. Storage account does not exist"
-                      log "ERROR" "  4. Insufficient permissions to read account metadata"
-                    fi
-                    
-                    # Test 3: Show detailed Azure CLI error
-                    log "INFO" "Test 3: Detailed error output..."
-                    az storage container list \
-                      --account-name "$AZURE_STORAGE_ACCOUNT" \
-                      --account-key "$AZURE_STORAGE_KEY" \
-                      --output json \
-                      --debug 2>&1 | head -20 || true
+                    # Check what we got from regular clone
+                    if [ -d "$repo_path/.git" ]; then
+                      local commit_count=$(cd "$repo_path" && git rev-list --all --count 2>/dev/null || echo "0")
+                      local branch_count=$(cd "$repo_path" && git branch -r 2>/dev/null | wc -l)
+                      size_bytes=$(du -sb "$repo_path" 2>/dev/null | cut -f1 || echo "0")
                       
-                    exit 1
-                  fi
-
-                  # Create/verify container
-                  log "INFO" "📦 Ensuring backup container exists: $CONTAINER_NAME"
-
-                  # Check if container exists
-                  container_exists=$(az storage container exists \
-                    --account-name "$AZURE_STORAGE_ACCOUNT" \
-                    --account-key "$AZURE_STORAGE_KEY" \
-                    --name "$CONTAINER_NAME" \
-                    --query "exists" \
-                    --output tsv 2>/dev/null || echo "false")
-
-                  if [ "$container_exists" = "true" ]; then
-                    log "INFO" "✅ Container '$CONTAINER_NAME' already exists"
-                  else
-                    log "INFO" "📁 Creating container '$CONTAINER_NAME'..."
-                    if az storage container create \
-                      --account-name "$AZURE_STORAGE_ACCOUNT" \
-                      --account-key "$AZURE_STORAGE_KEY" \
-                      --name "$CONTAINER_NAME" \
-                      --public-access off \
-                      --output none 2>&1; then
-                      log "INFO" "✅ Container created successfully"
-                    else
-                      log "ERROR" "❌ Failed to create container. Error details:"
-                      az storage container create \
-                        --account-name "$AZURE_STORAGE_ACCOUNT" \
-                        --account-key "$AZURE_STORAGE_KEY" \
-                        --name "$CONTAINER_NAME" \
-                        --public-access off 2>&1 || true
-                      exit 1
-                    fi
-                  fi
-
-                  log "INFO" "🎉 Azure CLI setup completed successfully"
-
-            - name: Backup repositories
-              run: |
-                  set -euo pipefail
-
-                  # Global variables
-                  DATE_STR=$(date +%Y%m%d_%H%M%S)
-                  TEMP_BASE_DIR=$(mktemp -d)
-                  SUCCESSFUL_BACKUPS=()
-                  FAILED_BACKUPS=()
-                  BACKUP_STATS=""
-
-                  # Cleanup on exit
-                  trap 'cleanup_and_exit' EXIT
-
-                  cleanup_and_exit() {
-                    echo "🧹 Cleaning up temporary files..."
-                    rm -rf "$TEMP_BASE_DIR"
-                  }
-
-                  # Enhanced logging function
-                  log() {
-                    local level="$1"
-                    shift
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*"
-                  }
-
-                  # Retry function with exponential backoff (simplified)
-                  retry_command() {
-                    local max_attempts="$1"
-                    local delay="$2"
-                    shift 2
-                    local attempt=1
-                    
-                    while [ $attempt -le $max_attempts ]; do
-                      log "INFO" "Executing command (attempt $attempt of $max_attempts)"
+                      log "INFO" "📊 Regular clone results:"
+                      log "INFO" "  - Commits: $commit_count"
+                      log "INFO" "  - Remote branches: $branch_count"
+                      log "INFO" "  - Total size: $(numfmt --to=iec $size_bytes 2>/dev/null || echo "${size_bytes} bytes")"
                       
-                      if "$@"; then
+                      if [ "$commit_count" -gt 0 ] && [ "$size_bytes" -gt 1000 ]; then
+                        log "INFO" "✅ Successfully cloned $repo_name with regular clone"
+                        rm -f "$clone_error_file"
+                        echo "$repo_path"
                         return 0
                       else
-                        if [ $attempt -eq $max_attempts ]; then
-                          log "ERROR" "Command failed after $max_attempts attempts"
-                          return 1
-                        fi
+                        log "ERROR" "❌ Regular clone also produced empty repository"
                         
-                        local wait_time=$((delay * attempt))
-                        log "WARN" "Command failed, retrying in ${wait_time}s..."
-                        sleep $wait_time
-                        attempt=$((attempt + 1))
-                      fi
-                    done
-                  }
-
-                  # Enhanced webhook function with retry
-                  send_webhook() {
-                    local success="$1"
-                    local message="$2"
-                    local details="$3"
-                    
-                    if [ -z "$WEBHOOK_URL" ]; then
-                      log "INFO" "No webhook URL configured, skipping notification"
-                      return 0
-                    fi
-                    
-                    # Sanitize message for JSON
-                    local safe_message=$(echo "$message" | jq -Rs .)
-                    
-                    local payload=$(jq -n \
-                      --argjson success "$success" \
-                      --argjson message "$safe_message" \
-                      --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
-                      --arg workflow "repository-backup" \
-                      --argjson details "$details" \
-                      '{
-                        success: $success,
-                        message: $message,
-                        timestamp: $timestamp,
-                        workflow: $workflow,
-                        details: $details
-                      }')
-                    
-                    log "INFO" "Sending webhook notification..."
-                    
-                    local response_file=$(mktemp)
-                    local http_code
-                    
-                    http_code=$(curl -s -w "%{http_code}" \
-                      -X POST "$WEBHOOK_URL" \
-                      -H "Content-Type: application/json" \
-                      -H "User-Agent: GitHub-Actions-Backup/1.0" \
-                      -d "$payload" \
-                      --max-time 30 \
-                      --connect-timeout 10 \
-                      --retry 2 \
-                      --retry-delay 5 \
-                      -o "$response_file")
-                    
-                    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-                      log "INFO" "Webhook sent successfully (HTTP $http_code)"
-                    else
-                      log "ERROR" "Webhook failed (HTTP $http_code): $(cat "$response_file")"
-                    fi
-                    
-                    rm -f "$response_file"
-                  }
-
-                  # Enhanced repository cloning
-                  clone_repository() {
-                    local repo_url="$1"
-                    local temp_dir="$2"
-                    local repo_name=$(basename "$repo_url" .git)
-                    local repo_path="$temp_dir/${repo_name}_${DATE_STR}"
-                    
-                    log "INFO" "Cloning repository: $repo_name"
-                    
-                    # Prepare clone URL (avoid token leakage in logs)
-                    local clone_url="$repo_url"
-                    if [ -n "$BACKUP_TOKEN" ] && [[ "$repo_url" == *"github.com"* ]]; then
-                      clone_url="https://oauth2:${BACKUP_TOKEN}@$(echo "$repo_url" | sed 's|https://||')"
-                    fi
-                    
-                    # Clone with full history (proper backup)
-                    if git clone --mirror --quiet "$clone_url" "$repo_path" 2>/dev/null; then
-                      # Verify clone integrity
-                      if [ -d "$repo_path" ] && [ -d "$repo_path/refs" ]; then
-                        local ref_count=$(find "$repo_path/refs" -type f | wc -l)
-                        log "INFO" "Successfully cloned $repo_name ($ref_count refs)"
-                        echo "$repo_path"
-                      else
-                        log "ERROR" "Clone verification failed for $repo_name"
+                        # Try complete clone as last resort
+                        log "INFO" "🔄 Attempting complete clone as last resort..."
                         rm -rf "$repo_path"
-                        return 1
-                      fi
-                    else
-                      log "ERROR" "Failed to clone $repo_name"
-                      return 1
-                    fi
-                  }
-
-                  # Enhanced upload with detailed error reporting
-                  upload_to_blob_storage() {
-                    local repo_path="$1"
-                    local blob_name="$2"
-                    local repo_name=$(basename "$repo_path")
-                    
-                    log "INFO" "🗜️ Creating backup archive: $blob_name"
-                    
-                    if [ ! -d "$repo_path" ]; then
-                      log "ERROR" "Repository path does not exist: $repo_path"
-                      return 1
-                    fi
-                    
-                    # Calculate repository size
-                    local repo_size=$(du -sb "$repo_path" 2>/dev/null | cut -f1)
-                    if [ -z "$repo_size" ] || [ "$repo_size" -eq 0 ]; then
-                      log "ERROR" "Could not determine repository size for $repo_name"
-                      return 1
-                    fi
-                    
-                    log "INFO" "Repository size: $(numfmt --to=iec $repo_size 2>/dev/null || echo "${repo_size} bytes")"
-                    
-                    # Create compressed archive
-                    local tar_path="${repo_path}.tar.gz"
-                    log "INFO" "Creating archive: $tar_path"
-                    
-                    if ! tar -czf "$tar_path" -C "$(dirname "$repo_path")" "$(basename "$repo_path")" 2>/dev/null; then
-                      log "ERROR" "Failed to create archive for $repo_name"
-                      return 1
-                    fi
-                    
-                    if [ ! -f "$tar_path" ]; then
-                      log "ERROR" "Archive file was not created: $tar_path"
-                      return 1
-                    fi
-                    
-                    local archive_size=$(stat -c%s "$tar_path" 2>/dev/null)
-                    if [ -z "$archive_size" ] || [ "$archive_size" -eq 0 ]; then
-                      log "ERROR" "Archive appears to be empty or unreadable"
-                      rm -f "$tar_path"
-                      return 1
-                    fi
-                    
-                    # Calculate compression ratio safely
-                    local compression_ratio="N/A"
-                    if command -v bc >/dev/null 2>&1 && [ "$repo_size" -gt 0 ]; then
-                      compression_ratio=$(echo "scale=1; $archive_size * 100 / $repo_size" | bc -l 2>/dev/null || echo "N/A")
-                    fi
-                    
-                    log "INFO" "✅ Archive created: $(numfmt --to=iec $archive_size 2>/dev/null || echo "${archive_size} bytes") (${compression_ratio}% of original)"
-                    
-                    # Prepare metadata (simplified approach)
-                    local backup_date=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
-                    
-                    # Upload with detailed error reporting
-                    local upload_start=$(date +%s)
-                    local upload_success=false
-                    local attempt=1
-                    local max_attempts=3
-                    local last_error=""
-                    
-                    while [ $attempt -le $max_attempts ] && [ "$upload_success" = "false" ]; do
-                      log "INFO" "☁️ Upload attempt $attempt of $max_attempts for $blob_name"
-                      log "INFO" "File: $tar_path ($(ls -lh "$tar_path" | awk '{print $5}'))"
-                      
-                      # Create temporary error file to capture output
-                      local error_file=$(mktemp)
-                      
-                      # Try upload with verbose error capture
-                      if az storage blob upload \
-                        --account-name "$AZURE_STORAGE_ACCOUNT" \
-                        --account-key "$AZURE_STORAGE_KEY" \
-                        --container-name "$CONTAINER_NAME" \
-                        --name "$blob_name" \
-                        --file "$tar_path" \
-                        --overwrite \
-                        --content-type "application/gzip" \
-                        --no-progress \
-                        --output none 2>"$error_file"; then
-                        
-                        log "INFO" "✅ Upload command succeeded for $blob_name"
-                        upload_success=true
-                        rm -f "$error_file"
-                      else
-                        last_error=$(cat "$error_file" 2>/dev/null || echo "Unknown error")
-                        log "ERROR" "❌ Upload attempt $attempt failed for $blob_name"
-                        log "ERROR" "Azure CLI Error: $last_error"
-                        rm -f "$error_file"
-                        
-                        if [ $attempt -lt $max_attempts ]; then
-                          local wait_time=$((10 * attempt))
-                          log "INFO" "⏳ Waiting ${wait_time}s before retry..."
-                          sleep $wait_time
-                        fi
-                        attempt=$((attempt + 1))
-                      fi
-                    done
-                    
-                    if [ "$upload_success" = "false" ]; then
-                      log "ERROR" "💥 Failed to upload $blob_name after $max_attempts attempts"
-                      log "ERROR" "Last error: $last_error"
-                      rm -f "$tar_path"
-                      return 1
-                    fi
-                    
-                    local upload_duration=$(($(date +%s) - upload_start))
-                    
-                    # Calculate upload speed safely
-                    local upload_speed="N/A"
-                    if command -v bc >/dev/null 2>&1 && [ "$upload_duration" -gt 0 ]; then
-                      upload_speed=$(echo "scale=2; $archive_size / 1024 / 1024 / $upload_duration" | bc -l 2>/dev/null || echo "N/A")
-                    fi
-                    
-                    log "INFO" "⚡ Upload completed in ${upload_duration}s (${upload_speed} MB/s)"
-                    
-                    # Add delay before verification (Azure can have slight delay)
-                    log "INFO" "⏳ Waiting 5s for Azure consistency..."
-                    sleep 5
-                    
-                    # Verify upload exists with detailed error reporting
-                    log "INFO" "🔍 Verifying upload of $blob_name..."
-                    local verify_error_file=$(mktemp)
-                    
-                    if az storage blob exists \
-                      --account-name "$AZURE_STORAGE_ACCOUNT" \
-                      --account-key "$AZURE_STORAGE_KEY" \
-                      --container-name "$CONTAINER_NAME" \
-                      --name "$blob_name" \
-                      --output tsv 2>"$verify_error_file" | grep -q "true"; then
-                      
-                      log "INFO" "✅ Successfully uploaded and verified $blob_name"
-                      
-                      # Try to add metadata after successful upload (non-critical)
-                      log "INFO" "📝 Adding metadata to blob..."
-                      az storage blob metadata update \
-                        --account-name "$AZURE_STORAGE_ACCOUNT" \
-                        --account-key "$AZURE_STORAGE_KEY" \
-                        --container-name "$CONTAINER_NAME" \
-                        --name "$blob_name" \
-                        --metadata "backup_date=$backup_date" "ttl_days=$RETENTION_DAYS" "repo_size=$repo_size" "archive_size=$archive_size" \
-                        2>/dev/null || log "WARN" "Failed to add metadata (non-critical)"
-                      
-                      rm -f "$tar_path" "$verify_error_file"
-                      echo "$repo_size,$archive_size,$upload_duration"
-                      return 0
-                    else
-                      local verify_error=$(cat "$verify_error_file" 2>/dev/null || echo "Unknown verification error")
-                      log "ERROR" "❌ Upload verification failed for $blob_name"
-                      log "ERROR" "Verification error: $verify_error"
-                      
-                      # Try to list blobs to see what's actually there
-                      log "INFO" "🔍 Listing recent blobs for debugging..."
-                      az storage blob list \
-                        --account-name "$AZURE_STORAGE_ACCOUNT" \
-                        --account-key "$AZURE_STORAGE_KEY" \
-                        --container-name "$CONTAINER_NAME" \
-                        --prefix "$(echo "$blob_name" | cut -d'_' -f1)" \
-                        --query "[].{name:name,size:properties.contentLength,modified:properties.lastModified}" \
-                        --output table 2>/dev/null | head -10 || log "ERROR" "Could not list blobs"
-                      
-                      rm -f "$tar_path" "$verify_error_file"
-                      return 1
-                    fi
-                  }
-
-                  # Enhanced cleanup with safety checks
-                  cleanup_old_backups() {
-                    log "INFO" "Starting cleanup of backups older than $RETENTION_DAYS days..."
-                    
-                    local cutoff_date=$(date -u -d "$RETENTION_DAYS days ago" +%Y-%m-%dT%H:%M:%S.000Z)
-                    local deleted_count=0
-                    local total_freed=0
-                    
-                    # Get old backups
-                    local old_blobs=$(az storage blob list \
-                      --account-name "$AZURE_STORAGE_ACCOUNT" \
-                      --account-key "$AZURE_STORAGE_KEY" \
-                      --container-name "$CONTAINER_NAME" \
-                      --query "[?metadata.backup_date && metadata.backup_date < '$cutoff_date'].{name:name,size:properties.contentLength}" \
-                      --output json)
-                    
-                    if [ "$old_blobs" != "[]" ]; then
-                      echo "$old_blobs" | jq -r '.[] | "\(.name) \(.size)"' | while read -r blob_name blob_size; do
-                        if [ -n "$blob_name" ]; then
-                          log "INFO" "Deleting old backup: $blob_name ($(numfmt --to=iec $blob_size))"
+                        if git clone "$clone_url" "$repo_path" 2>"$clone_error_file"; then
+                          log "INFO" "✅ Complete clone successful"
                           
-                          if az storage blob delete \
-                            --account-name "$AZURE_STORAGE_ACCOUNT" \
-                            --account-key "$AZURE_STORAGE_KEY" \
-                            --container-name "$CONTAINER_NAME" \
-                            --name "$blob_name" \
-                            --output none; then
+                          if [ -d "$repo_path/.git" ]; then
+                            local commit_count=$(cd "$repo_path" && git rev-list --all --count 2>/dev/null || echo "0")
+                            local branch_count=$(cd "$repo_path" && git branch -r 2>/dev/null | wc -l)
+                            size_bytes=$(du -sb "$repo_path" 2>/dev/null | cut -f1 || echo "0")
                             
-                            deleted_count=$((deleted_count + 1))
-                            total_freed=$((total_freed + blob_size))
+                            log "INFO" "📊 Complete clone results:"
+                            log "INFO" "  - Commits: $commit_count"
+                            log "INFO" "  - Remote branches: $branch_count"
+                            log "INFO" "  - Total size: $(numfmt --to=iec $size_bytes 2>/dev/null || echo "${size_bytes} bytes")"
+                            
+                            if [ "$commit_count" -gt 0 ] && [ "$size_bytes" -gt 1000 ]; then
+                              log "INFO" "✅ Successfully cloned $repo_name with complete clone"
+                              rm -f "$clone_error_file"
+                              echo "$repo_path"
+                              return 0
+                            else
+                              log "ERROR" "❌ Complete clone also produced empty repository"
+                            fi
                           else
-                            log "ERROR" "Failed to delete $blob_name"
-                          fi
-                        fi
-                      done
-                      
-                      log "INFO" "Cleanup completed: $deleted_count files deleted, $(numfmt --to=iec $total_freed) freed"
-                    else
-                      log "INFO" "No old backups found to clean up"
-                    fi
-                  }
-
-                  # Main backup process
-                  log "INFO" "🚀 Starting repository backup process..."
-
-                  # Read and validate repository list
-                  repos=$(grep -v '^[[:space:]]*#' repos.txt | grep -v '^[[:space:]]*$' | sort -u)
-                  repo_count=$(echo "$repos" | wc -l)
-
-                  log "INFO" "Processing $repo_count repositories..."
-
-                  # Process repositories
-                  backup_start=$(date +%s)
-                  total_size=0
-                  total_compressed=0
-
-                  echo "$repos" | while IFS= read -r repo_url; do
-                    if [ -n "$repo_url" ]; then
-                      repo_start=$(date +%s)
-                      repo_name=$(basename "$repo_url" .git)
-                      
-                      log "INFO" "📦 Processing: $repo_name"
-                      
-                      # Create isolated temp directory for this repo
-                      repo_temp_dir=$(mktemp -d -p "$TEMP_BASE_DIR")
-                      
-                      # Clone repository
-                      if repo_path=$(clone_repository "$repo_url" "$repo_temp_dir"); then
-                        blob_name="${repo_name}_${DATE_STR}.tar.gz"
-                        
-                        log "INFO" "Repository cloned successfully: $repo_path"
-                        log "INFO" "Starting upload process for blob: $blob_name"
-                        
-                        # Upload to Azure
-                        if backup_stats=$(upload_to_blob_storage "$repo_path" "$blob_name"); then
-                          log "INFO" "Upload function returned: $backup_stats"
-                          
-                          # Parse the returned stats
-                          if [[ "$backup_stats" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]]; then
-                            IFS=',' read -r repo_size archive_size upload_time <<< "$backup_stats"
-                            
-                            repo_duration=$(($(date +%s) - repo_start))
-                            
-                            SUCCESSFUL_BACKUPS+=($(jq -n \
-                              --arg repo "$repo_url" \
-                              --arg blob_name "$blob_name" \
-                              --argjson repo_size "$repo_size" \
-                              --argjson archive_size "$archive_size" \
-                              --argjson duration "$repo_duration" \
-                              '{repo: $repo, blob_name: $blob_name, repo_size: $repo_size, archive_size: $archive_size, duration: $duration}'))
-                            
-                            total_size=$((total_size + repo_size))
-                            total_compressed=$((total_compressed + archive_size))
-                            
-                            log "INFO" "✅ Successfully backed up $repo_name in ${repo_duration}s"
-                          else
-                            log "ERROR" "Invalid backup stats format returned: '$backup_stats'"
-                            FAILED_BACKUPS+=($(jq -n \
-                              --arg repo "$repo_url" \
-                              --arg error "Invalid backup stats returned" \
-                              '{repo: $repo, error: $error}'))
+                            log "ERROR" "❌ Complete clone didn't create .git directory"
                           fi
                         else
-                          upload_exit_code=$?
-                          log "ERROR" "Upload function failed with exit code: $upload_exit_code"
-                          FAILED_BACKUPS+=($(jq -n \
-                            --arg repo "$repo_url" \
-                            --arg error "Upload failed (exit code: $upload_exit_code)" \
-                            '{repo: $repo, error: $error}'))
-                          log "ERROR" "❌ Failed to upload $repo_name"
+                          local complete_error=$(cat "$clone_error_file" 2>/dev/null || echo "Unknown clone error")
+                          log "ERROR" "❌ Complete clone also failed: $complete_error"
                         fi
-                      else
-                        clone_exit_code=$?
-                        log "ERROR" "Clone function failed with exit code: $clone_exit_code"
-                        FAILED_BACKUPS+=($(jq -n \
-                          --arg repo "$repo_url" \
-                          --arg error "Clone failed (exit code: $clone_exit_code)" \
-                          '{repo: $repo, error: $error}'))
-                        log "ERROR" "❌ Failed to clone $repo_name"
                       fi
-                      
-                      # Cleanup repo temp directory
-                      rm -rf "$repo_temp_dir"
+                    else
+                      log "ERROR" "❌ Regular clone didn't create .git directory"
                     fi
-                  done
-
-                  # Cleanup old backups
-                  if [ "${{ github.event.inputs.force_cleanup }}" = "true" ] || [ "$(date +%u)" = "7" ]; then
-                    cleanup_old_backups
-                  fi
-
-                  # Calculate final statistics
-                  backup_duration=$(($(date +%s) - backup_start))
-                  successful_count=${#SUCCESSFUL_BACKUPS[@]}
-                  failed_count=${#FAILED_BACKUPS[@]}
-
-                  log "INFO" "📊 Backup Summary:"
-                  log "INFO" "  - Duration: $(date -u -d @$backup_duration +%H:%M:%S)"
-                  log "INFO" "  - Successful: $successful_count"
-                  log "INFO" "  - Failed: $failed_count"
-                  log "INFO" "  - Total size: $(numfmt --to=iec $total_size)"
-                  log "INFO" "  - Compressed: $(numfmt --to=iec $total_compressed)"
-
-                  if [ $total_size -gt 0 ]; then
-                    compression_ratio=$(echo "scale=1; $total_compressed * 100 / $total_size" | bc -l)
-                    log "INFO" "  - Compression: ${compression_ratio}%"
-                  fi
-
-                  # Send final webhook
-                  if [ $failed_count -gt 0 ]; then
-                    failed_json=$(printf '%s\n' "${FAILED_BACKUPS[@]}" | jq -s .)
-                    successful_json=$(printf '%s\n' "${SUCCESSFUL_BACKUPS[@]}" | jq -s .)
-                    
-                    details=$(jq -n \
-                      --argjson successful "$successful_count" \
-                      --argjson failed "$failed_count" \
-                      --argjson duration "$backup_duration" \
-                      --argjson total_size "$total_size" \
-                      --argjson total_compressed "$total_compressed" \
-                      --argjson failed_repos "$failed_json" \
-                      --argjson successful_repos "$successful_json" \
-                      '{
-                        successful: $successful,
-                        failed: $failed,
-                        duration: $duration,
-                        total_size: $total_size,
-                        total_compressed: $total_compressed,
-                        failed_repos: $failed_repos,
-                        successful_repos: $successful_repos
-                      }')
-                    
-                    send_webhook false "Backup completed with $failed_count failures out of $repo_count repositories" "$details"
-                    exit 1
                   else
-                    successful_json=$(printf '%s\n' "${SUCCESSFUL_BACKUPS[@]}" | jq -s .)
-                    
-                    details=$(jq -n \
-                      --argjson successful "$successful_count" \
-                      --argjson duration "$backup_duration" \
-                      --argjson total_size "$total_size" \
-                      --argjson total_compressed "$total_compressed" \
-                      --argjson backed_up_repos "$successful_json" \
-                      '{
-                        successful: $successful,
-                        duration: $duration,
-                        total_size: $total_size,
-                        total_compressed: $total_compressed,
-                        backed_up_repos: $backed_up_repos
-                      }')
-                    
-                    send_webhook true "All $successful_count repositories backed up successfully" "$details"
+                    local regular_error=$(cat "$clone_error_file" 2>/dev/null || echo "Unknown clone error")
+                    log "ERROR" "❌ Regular clone also failed: $regular_error"
                   fi
+                elif [ "$size_bytes" -gt 1000 ]; then
+                  log "INFO" "✅ Successfully cloned $repo_name with mirror"
+                  rm -f "$clone_error_file"
+                  echo "$repo_path"
+                  return 0
+                else
+                  log "WARN" "⚠️ Mirror clone produced very small repository ($size_bytes bytes)"
+                fi
+              else
+                log "ERROR" "❌ Clone directory was not created"
+              fi
+            else
+              local clone_error=$(cat "$clone_error_file" 2>/dev/null || echo "Unknown clone error")
+              log "ERROR" "❌ Mirror clone failed: $clone_error"
+            fi
+            
+            rm -f "$clone_error_file"
+            rm -rf "$repo_path"
+            return 1
+          }
+          
+          # Enhanced upload with detailed error reporting
+          upload_to_blob_storage() {
+            local repo_path="$1"
+            local blob_name="$2"
+            local repo_name=$(basename "$repo_path")
+            
+            log "INFO" "🗜️ Starting upload process for: $blob_name"
+            log "INFO" "Repository path: $repo_path"
+            
+            # Early validation
+            if [ ! -d "$repo_path" ]; then
+              log "ERROR" "❌ Repository path does not exist: $repo_path"
+              return 1
+            fi
+            
+            # Check directory contents
+            local file_count=$(find "$repo_path" -type f 2>/dev/null | wc -l)
+            log "INFO" "Repository contains $file_count files"
+            
+            if [ "$file_count" -eq 0 ]; then
+              log "WARN" "⚠️ Repository appears to be empty"
+              # Still proceed - even empty repos can be backed up
+            fi
+            
+            # Calculate repository size
+            local repo_size=$(du -sb "$repo_path" 2>/dev/null | cut -f1)
+            if [ -z "$repo_size" ]; then
+              log "ERROR" "❌ Could not determine repository size"
+              return 1
+            fi
+            
+            log "INFO" "📏 Repository size: $(numfmt --to=iec $repo_size 2>/dev/null || echo "${repo_size} bytes")"
+            
+            if [ "$repo_size" -eq 0 ]; then
+              log "ERROR" "❌ Repository size is 0 bytes - cannot create backup"
+              return 1
+            fi
+            
+            # Create compressed archive
+            local zip_path="${repo_path}.zip"
+            log "INFO" "📦 Creating archive: $zip_path"
+            
+            # Create archive with error capture
+            local zip_error_file=$(mktemp)
+            if zip -r "$zip_path" "$repo_path" >"$zip_error_file" 2>&1; then
+              log "INFO" "✅ Archive creation successful"
+            else
+              local zip_error=$(cat "$zip_error_file" 2>/dev/null || echo "Unknown zip error")
+              log "ERROR" "❌ Failed to create archive for $repo_name"
+              log "ERROR" "Zip error: $zip_error"
+              rm -f "$zip_error_file"
+              return 1
+            fi
+            rm -f "$zip_error_file"
+            
+            # Validate archive was created
+            if [ ! -f "$zip_path" ]; then
+              log "ERROR" "❌ Archive file was not created: $zip_path"
+              return 1
+            fi
+            
+            local archive_size=$(stat -c%s "$zip_path" 2>/dev/null)
+            if [ -z "$archive_size" ] || [ "$archive_size" -eq 0 ]; then
+              log "ERROR" "❌ Archive appears to be empty or unreadable"
+              log "ERROR" "Archive path: $zip_path"
+              log "ERROR" "Archive size: $archive_size"
+              rm -f "$zip_path"
+              return 1
+            fi
+            
+            # Calculate compression ratio
+            local compression_ratio="N/A"
+            if command -v bc >/dev/null 2>&1 && [ "$repo_size" -gt 0 ]; then
+              compression_ratio=$(echo "scale=1; $archive_size * 100 / $repo_size" | bc -l 2>/dev/null || echo "N/A")
+            fi
+            
+            log "INFO" "📊 Archive created: $(numfmt --to=iec $archive_size 2>/dev/null || echo "${archive_size} bytes") (${compression_ratio}% compression)"
+            
+            # Test archive integrity
+            if ! unzip -t "$zip_path" >/dev/null 2>&1; then
+              log "ERROR" "❌ Archive integrity check failed"
+              rm -f "$zip_path"
+              return 1
+            fi
+            
+            log "INFO" "✅ Archive integrity verified"
+            
+            # Upload process
+            local upload_start=$(date +%s)
+            local upload_success=false
+            local attempt=1
+            local max_attempts=3
+            local last_error=""
+            
+            while [ $attempt -le $max_attempts ] && [ "$upload_success" = "false" ]; do
+              log "INFO" "☁️ Upload attempt $attempt of $max_attempts"
+              log "INFO" "Blob name: $blob_name"
+              log "INFO" "File size: $(ls -lh "$zip_path" | awk '{print $5}')"
+              
+              # Create error capture file
+              local upload_error_file=$(mktemp)
+              
+              # Execute upload with detailed error capture
+              if az storage blob upload \
+                --account-name "$AZURE_STORAGE_ACCOUNT" \
+                --account-key "$AZURE_STORAGE_KEY" \
+                --container-name "$CONTAINER_NAME" \
+                --name "$blob_name" \
+                --file "$zip_path" \
+                --overwrite \
+                --content-type "application/zip" \
+                --no-progress \
+                --output json 2>"$upload_error_file"; then
+                
+                log "INFO" "✅ Upload command succeeded"
+                upload_success=true
+                rm -f "$upload_error_file"
+              else
+                last_error=$(cat "$upload_error_file" 2>/dev/null || echo "Unknown upload error")
+                log "ERROR" "❌ Upload attempt $attempt failed"
+                log "ERROR" "Azure CLI Error: $last_error"
+                rm -f "$upload_error_file"
+                
+                # Parse specific error types
+                if [[ "$last_error" == *"BlobAlreadyExists"* ]]; then
+                  log "WARN" "Blob already exists - this should be handled by --overwrite"
+                elif [[ "$last_error" == *"AuthenticationFailed"* ]]; then
+                  log "ERROR" "Authentication failed during upload"
+                elif [[ "$last_error" == *"timeout"* ]] || [[ "$last_error" == *"ConnectionError"* ]]; then
+                  log "WARN" "Network timeout/connection error - will retry"
+                elif [[ "$last_error" == *"QuotaExceeded"* ]]; then
+                  log "ERROR" "Storage quota exceeded"
+                elif [[ "$last_error" == *"InvalidBlobName"* ]]; then
+                  log "ERROR" "Invalid blob name: $blob_name"
+                fi
+                
+                if [ $attempt -lt $max_attempts ]; then
+                  local wait_time=$((10 * attempt))
+                  log "INFO" "⏳ Waiting ${wait_time}s before retry..."
+                  sleep $wait_time
+                fi
+                attempt=$((attempt + 1))
+              fi
+            done
+            
+            if [ "$upload_success" = "false" ]; then
+              log "ERROR" "💥 Upload failed after $max_attempts attempts"
+              log "ERROR" "Final error: $last_error"
+              rm -f "$tar_path"
+              return 1
+            fi
+            
+            local upload_duration=$(($(date +%s) - upload_start))
+            local upload_speed="N/A"
+            if command -v bc >/dev/null 2>&1 && [ "$upload_duration" -gt 0 ]; then
+              upload_speed=$(echo "scale=2; $archive_size / 1024 / 1024 / $upload_duration" | bc -l 2>/dev/null || echo "N/A")
+            fi
+            
+            log "INFO" "⚡ Upload completed in ${upload_duration}s (${upload_speed} MB/s)"
+            
+            # Verification with retry
+            log "INFO" "🔍 Verifying blob existence..."
+            local verify_attempts=0
+            local verify_success=false
+            
+            while [ $verify_attempts -lt 3 ] && [ "$verify_success" = "false" ]; do
+              if [ $verify_attempts -gt 0 ]; then
+                log "INFO" "⏳ Waiting 3s for Azure consistency..."
+                sleep 3
+              fi
+              
+              local verify_error_file=$(mktemp)
+              if az storage blob exists \
+                --account-name "$AZURE_STORAGE_ACCOUNT" \
+                --account-key "$AZURE_STORAGE_KEY" \
+                --container-name "$CONTAINER_NAME" \
+                --name "$blob_name" \
+                --output json 2>"$verify_error_file" | jq -r '.exists' | grep -q "true"; then
+                
+                verify_success=true
+                rm -f "$verify_error_file"
+              else
+                local verify_error=$(cat "$verify_error_file" 2>/dev/null || echo "Unknown verification error")
+                log "WARN" "Verification attempt $((verify_attempts + 1)) failed: $verify_error"
+                rm -f "$verify_error_file"
+                verify_attempts=$((verify_attempts + 1))
+              fi
+            done
+            
+            if [ "$verify_success" = "true" ]; then
+              log "INFO" "✅ Upload verified successfully"
+              
+              # Add metadata (non-critical)
+              local backup_date=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+              az storage blob metadata update \
+                --account-name "$AZURE_STORAGE_ACCOUNT" \
+                --account-key "$AZURE_STORAGE_KEY" \
+                --container-name "$CONTAINER_NAME" \
+                --name "$blob_name" \
+                --metadata "backup_date=$backup_date" "ttl_days=$RETENTION_DAYS" "repo_size=$repo_size" "archive_size=$archive_size" \
+                2>/dev/null && log "INFO" "📝 Metadata added" || log "WARN" "⚠️ Metadata failed (non-critical)"
+              
+              rm -f "$tar_path"
+              echo "$repo_size,$archive_size,$upload_duration"
+              return 0
+            else
+              log "ERROR" "❌ Upload verification failed after retries"
+              
+              # Debug: List recent blobs
+              log "INFO" "🔍 Recent blobs in container:"
+              az storage blob list \
+                --account-name "$AZURE_STORAGE_ACCOUNT" \
+                --account-key "$AZURE_STORAGE_KEY" \
+                --container-name "$CONTAINER_NAME" \
+                --query "[?contains(name, '$(echo "$blob_name" | cut -d'_' -f1)')].{name:name,size:properties.contentLength,modified:properties.lastModified}" \
+                --output table 2>/dev/null | head -5 || log "ERROR" "Could not list blobs"
+              
+              rm -f "$tar_path"
+              return 1
+            fi
+          }
+          
+          # Enhanced cleanup with safety checks
+          cleanup_old_backups() {
+            log "INFO" "Starting cleanup of backups older than $RETENTION_DAYS days..."
+            
+            local cutoff_date=$(date -u -d "$RETENTION_DAYS days ago" +%Y-%m-%dT%H:%M:%S.000Z)
+            local deleted_count=0
+            local total_freed=0
+            
+            # Get old backups
+            local old_blobs=$(az storage blob list \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --account-key "$AZURE_STORAGE_KEY" \
+              --container-name "$CONTAINER_NAME" \
+              --query "[?metadata.backup_date && metadata.backup_date < '$cutoff_date'].{name:name,size:properties.contentLength}" \
+              --output json)
+            
+            if [ "$old_blobs" != "[]" ]; then
+              echo "$old_blobs" | jq -r '.[] | "\(.name) \(.size)"' | while read -r blob_name blob_size; do
+                if [ -n "$blob_name" ]; then
+                  log "INFO" "Deleting old backup: $blob_name ($(numfmt --to=iec $blob_size))"
+                  
+                  if az storage blob delete \
+                    --account-name "$AZURE_STORAGE_ACCOUNT" \
+                    --account-key "$AZURE_STORAGE_KEY" \
+                    --container-name "$CONTAINER_NAME" \
+                    --name "$blob_name" \
+                    --output none; then
+                    
+                    deleted_count=$((deleted_count + 1))
+                    total_freed=$((total_freed + blob_size))
+                  else
+                    log "ERROR" "Failed to delete $blob_name"
+                  fi
+                fi
+              done
+              
+              log "INFO" "Cleanup completed: $deleted_count files deleted, $(numfmt --to=iec $total_freed) freed"
+            else
+              log "INFO" "No old backups found to clean up"
+            fi
+          }
+          
+          # Main backup process
+          log "INFO" "🚀 Starting repository backup process..."
+          
+          # Read and validate repository list
+          repos=$(grep -v '^[[:space:]]*#' repos.txt | grep -v '^[[:space:]]*$' | sort -u)
+          repo_count=$(echo "$repos" | wc -l)
+          
+          log "INFO" "Processing $repo_count repositories..."
+          
+          # Process repositories with fixed array handling
+          backup_start=$(date +%s)
+          total_size=0
+          total_compressed=0
+          declare -a SUCCESSFUL_BACKUPS
+          declare -a FAILED_BACKUPS
+          
+          echo "$repos" | while IFS= read -r repo_url; do
+            if [ -n "$repo_url" ]; then
+              repo_start=$(date +%s)
+              repo_name=$(basename "$repo_url" .git)
+              
+              log "INFO" "📦 Processing: $repo_name"
+              
+              # Create isolated temp directory for this repo
+              repo_temp_dir=$(mktemp -d -p "$TEMP_BASE_DIR")
+              
+              # Clone repository
+              if repo_path=$(clone_repository "$repo_url" "$repo_temp_dir"); then
+                blob_name="${repo_name}_${DATE_STR}.zip"
+                
+                log "INFO" "Repository cloned successfully: $repo_path"
+                log "INFO" "Starting upload process for blob: $blob_name"
+                
+                # Upload to Azure
+                if backup_stats=$(upload_to_blob_storage "$repo_path" "$blob_name"); then
+                  log "INFO" "Upload function returned: $backup_stats"
+                  
+                  # Parse the returned stats
+                  if [[ "$backup_stats" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]]; then
+                    IFS=',' read -r repo_size archive_size upload_time <<< "$backup_stats"
+                    
+                    repo_duration=$(($(date +%s) - repo_start))
+                    
+                    SUCCESSFUL_BACKUPS+=($(jq -n \
+                      --arg repo "$repo_url" \
+                      --arg blob_name "$blob_name" \
+                      --argjson repo_size "$repo_size" \
+                      --argjson archive_size "$archive_size" \
+                      --argjson duration "$repo_duration" \
+                      '{repo: $repo, blob_name: $blob_name, repo_size: $repo_size, archive_size: $archive_size, duration: $duration}'))
+                    
+                    total_size=$((total_size + repo_size))
+                    total_compressed=$((total_compressed + archive_size))
+                    
+                    log "INFO" "✅ Successfully backed up $repo_name in ${repo_duration}s"
+                  else
+                    log "ERROR" "Invalid backup stats format returned: '$backup_stats'"
+                    FAILED_BACKUPS+=($(jq -n \
+                      --arg repo "$repo_url" \
+                      --arg error "Invalid backup stats returned" \
+                      '{repo: $repo, error: $error}'))
+                  fi
+                else
+                  upload_exit_code=$?
+                  log "ERROR" "Upload function failed with exit code: $upload_exit_code"
+                  FAILED_BACKUPS+=($(jq -n \
+                    --arg repo "$repo_url" \
+                    --arg error "Upload failed (exit code: $upload_exit_code)" \
+                    '{repo: $repo, error: $error}'))
+                  log "ERROR" "❌ Failed to upload $repo_name"
+                fi
+              else
+                clone_exit_code=$?
+                log "ERROR" "Clone function failed with exit code: $clone_exit_code"
+                FAILED_BACKUPS+=($(jq -n \
+                  --arg repo "$repo_url" \
+                  --arg error "Clone failed (exit code: $clone_exit_code)" \
+                  '{repo: $repo, error: $error}'))
+                log "ERROR" "❌ Failed to clone $repo_name"
+              fi
+              
+              # Cleanup repo temp directory
+              rm -rf "$repo_temp_dir"
+            fi
+          done
+          
+          # Store results in temporary files to pass between subshells
+          printf '%s\n' "${SUCCESSFUL_BACKUPS[@]}" > "$TEMP_BASE_DIR/successful.json" 2>/dev/null || echo "[]" > "$TEMP_BASE_DIR/successful.json"
+          printf '%s\n' "${FAILED_BACKUPS[@]}" > "$TEMP_BASE_DIR/failed.json" 2>/dev/null || echo "[]" > "$TEMP_BASE_DIR/failed.json"
+          echo "$total_size" > "$TEMP_BASE_DIR/total_size.txt"
+          echo "$total_compressed" > "$TEMP_BASE_DIR/total_compressed.txt"
+          
+          # Cleanup old backups
+          if [ "${{ github.event.inputs.force_cleanup }}" = "true" ] || [ "$(date +%u)" = "7" ]; then
+            cleanup_old_backups
+          fi
+          
+          # Read results from temporary files (arrays don't persist across subshells)
+          mapfile -t SUCCESSFUL_BACKUPS < "$TEMP_BASE_DIR/successful.json"
+          mapfile -t FAILED_BACKUPS < "$TEMP_BASE_DIR/failed.json"
+          total_size=$(cat "$TEMP_BASE_DIR/total_size.txt" 2>/dev/null || echo "0")
+          total_compressed=$(cat "$TEMP_BASE_DIR/total_compressed.txt" 2>/dev/null || echo "0")
+          
+          # Calculate final statistics
+          backup_duration=$(($(date +%s) - backup_start))
+          successful_count=${#SUCCESSFUL_BACKUPS[@]}
+          failed_count=${#FAILED_BACKUPS[@]}
+          
+          # Handle case where files might be empty
+          if [ "$successful_count" -eq 1 ] && [ -z "${SUCCESSFUL_BACKUPS[0]}" ]; then
+            successful_count=0
+            SUCCESSFUL_BACKUPS=()
+          fi
+          
+          if [ "$failed_count" -eq 1 ] && [ -z "${FAILED_BACKUPS[0]}" ]; then
+            failed_count=0
+            FAILED_BACKUPS=()
+          fi
+          
+          log "INFO" "📊 Backup Summary:"
+          log "INFO" "  - Duration: $(date -u -d @$backup_duration +%H:%M:%S)"
+          log "INFO" "  - Successful: $successful_count"
+          log "INFO" "  - Failed: $failed_count"
+          log "INFO" "  - Total size: $(numfmt --to=iec $total_size 2>/dev/null || echo "${total_size} bytes")"
+          log "INFO" "  - Compressed: $(numfmt --to=iec $total_compressed 2>/dev/null || echo "${total_compressed} bytes")"
+          
+          if [ "$total_size" -gt 0 ] && command -v bc >/dev/null 2>&1; then
+            compression_ratio=$(echo "scale=1; $total_compressed * 100 / $total_size" | bc -l 2>/dev/null || echo "N/A")
+            log "INFO" "  - Compression: ${compression_ratio}%"
+          fi
+          
+          # Send final webhook
+          if [ $failed_count -gt 0 ]; then
+            # Convert arrays to proper JSON arrays
+            if [ ${#FAILED_BACKUPS[@]} -gt 0 ]; then
+              failed_json=$(printf '%s\n' "${FAILED_BACKUPS[@]}" | jq -s 'map(select(length > 0))')
+            else
+              failed_json="[]"
+            fi
+            
+            if [ ${#SUCCESSFUL_BACKUPS[@]} -gt 0 ]; then
+              successful_json=$(printf '%s\n' "${SUCCESSFUL_BACKUPS[@]}" | jq -s 'map(select(length > 0))')
+            else
+              successful_json="[]"
+            fi
+            
+            details=$(jq -n \
+              --argjson successful "$successful_count" \
+              --argjson failed "$failed_count" \
+              --argjson duration "$backup_duration" \
+              --argjson total_size "$total_size" \
+              --argjson total_compressed "$total_compressed" \
+              --argjson failed_repos "$failed_json" \
+              --argjson successful_repos "$successful_json" \
+              '{
+                successful: $successful,
+                failed: $failed,
+                duration: $duration,
+                total_size: $total_size,
+                total_compressed: $total_compressed,
+                failed_repos: $failed_repos,
+                successful_repos: $successful_repos
+              }')
+            
+            send_webhook false "Backup completed with $failed_count failures out of $((successful_count + failed_count)) repositories" "$details"
+            log "ERROR" "💥 Backup process completed with failures"
+            exit 1
+          else
+            if [ ${#SUCCESSFUL_BACKUPS[@]} -gt 0 ]; then
+              successful_json=$(printf '%s\n' "${SUCCESSFUL_BACKUPS[@]}" | jq -s 'map(select(length > 0))')
+            else
+              successful_json="[]"
+            fi
+            
+            details=$(jq -n \
+              --argjson successful "$successful_count" \
+              --argjson duration "$backup_duration" \
+              --argjson total_size "$total_size" \
+              --argjson total_compressed "$total_compressed" \
+              --argjson backed_up_repos "$successful_json" \
+              '{
+                successful: $successful,
+                duration: $duration,
+                total_size: $total_size,
+                total_compressed: $total_compressed,
+                backed_up_repos: $backed_up_repos
+              }')
+            
+            send_webhook true "All $successful_count repositories backed up successfully" "$details"
+          fi
+          
+          log "INFO" "🎉 Backup process completed successfully!"
 
-                  log "INFO" "🎉 Backup process completed successfully!"
-
-            - name: Upload job artifacts
-              if: always()
-              uses: actions/upload-artifact@v4
-              with:
-                  name: backup-logs-${{ github.run_number }}
-                  path: |
-                      /tmp/backup-*.log
-                  retention-days: 7
+      - name: Upload job artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-logs-${{ github.run_number }}
+          path: |
+            /tmp/backup-*.log
+          retention-days: 7
