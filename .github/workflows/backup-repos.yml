@@ -363,13 +363,13 @@ jobs:
                     fi
                   }
 
-                  # Enhanced upload with validation
+                  # Enhanced upload with detailed error reporting
                   upload_to_blob_storage() {
                     local repo_path="$1"
                     local blob_name="$2"
                     local repo_name=$(basename "$repo_path")
                     
-                    log "INFO" "Creating backup archive: $blob_name"
+                    log "INFO" "🗜️ Creating backup archive: $blob_name"
                     
                     if [ ! -d "$repo_path" ]; then
                       log "ERROR" "Repository path does not exist: $repo_path"
@@ -412,35 +412,26 @@ jobs:
                       compression_ratio=$(echo "scale=1; $archive_size * 100 / $repo_size" | bc -l 2>/dev/null || echo "N/A")
                     fi
                     
-                    log "INFO" "Archive size: $(numfmt --to=iec $archive_size 2>/dev/null || echo "${archive_size} bytes") (${compression_ratio}% of original)"
+                    log "INFO" "✅ Archive created: $(numfmt --to=iec $archive_size 2>/dev/null || echo "${archive_size} bytes") (${compression_ratio}% of original)"
                     
-                    # Test Azure CLI connectivity first
-                    log "INFO" "Testing Azure connection..."
-                    if ! az storage account show \
-                      --name "$AZURE_STORAGE_ACCOUNT" \
-                      --query "name" \
-                      --output tsv >/dev/null 2>&1; then
-                      log "ERROR" "Cannot access Azure storage account: $AZURE_STORAGE_ACCOUNT"
-                      rm -f "$tar_path"
-                      return 1
-                    fi
+                    # Prepare metadata (simplified approach)
+                    local backup_date=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
                     
-                    # Upload with retries
+                    # Upload with detailed error reporting
                     local upload_start=$(date +%s)
                     local upload_success=false
                     local attempt=1
                     local max_attempts=3
+                    local last_error=""
                     
                     while [ $attempt -le $max_attempts ] && [ "$upload_success" = "false" ]; do
-                      log "INFO" "Upload attempt $attempt of $max_attempts for $blob_name"
+                      log "INFO" "☁️ Upload attempt $attempt of $max_attempts for $blob_name"
+                      log "INFO" "File: $tar_path ($(ls -lh "$tar_path" | awk '{print $5}'))"
                       
-                      # Create metadata as separate variables to avoid quoting issues
-                      local backup_date_meta="backup_date=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-                      local ttl_meta="ttl_days=$RETENTION_DAYS"
-                      local size_meta="repo_size=$repo_size"
-                      local archive_meta="archive_size=$archive_size"
+                      # Create temporary error file to capture output
+                      local error_file=$(mktemp)
                       
-                      # Execute upload command directly (avoiding complex retry function)
+                      # Try upload with verbose error capture
                       if az storage blob upload \
                         --account-name "$AZURE_STORAGE_ACCOUNT" \
                         --account-key "$AZURE_STORAGE_KEY" \
@@ -449,17 +440,21 @@ jobs:
                         --file "$tar_path" \
                         --overwrite \
                         --content-type "application/gzip" \
-                        --metadata "$backup_date_meta" "$ttl_meta" "$size_meta" "$archive_meta" \
                         --no-progress \
-                        --output none 2>/dev/null; then
+                        --output none 2>"$error_file"; then
                         
-                        log "INFO" "Upload command completed for $blob_name"
+                        log "INFO" "✅ Upload command succeeded for $blob_name"
                         upload_success=true
+                        rm -f "$error_file"
                       else
-                        log "WARN" "Upload attempt $attempt failed for $blob_name"
+                        last_error=$(cat "$error_file" 2>/dev/null || echo "Unknown error")
+                        log "ERROR" "❌ Upload attempt $attempt failed for $blob_name"
+                        log "ERROR" "Azure CLI Error: $last_error"
+                        rm -f "$error_file"
+                        
                         if [ $attempt -lt $max_attempts ]; then
-                          local wait_time=$((5 * attempt))
-                          log "INFO" "Waiting ${wait_time}s before retry..."
+                          local wait_time=$((10 * attempt))
+                          log "INFO" "⏳ Waiting ${wait_time}s before retry..."
                           sleep $wait_time
                         fi
                         attempt=$((attempt + 1))
@@ -467,7 +462,8 @@ jobs:
                     done
                     
                     if [ "$upload_success" = "false" ]; then
-                      log "ERROR" "Failed to upload $blob_name after $max_attempts attempts"
+                      log "ERROR" "💥 Failed to upload $blob_name after $max_attempts attempts"
+                      log "ERROR" "Last error: $last_error"
                       rm -f "$tar_path"
                       return 1
                     fi
@@ -480,24 +476,54 @@ jobs:
                       upload_speed=$(echo "scale=2; $archive_size / 1024 / 1024 / $upload_duration" | bc -l 2>/dev/null || echo "N/A")
                     fi
                     
-                    log "INFO" "Upload completed for $blob_name (${upload_speed} MB/s)"
+                    log "INFO" "⚡ Upload completed in ${upload_duration}s (${upload_speed} MB/s)"
                     
-                    # Verify upload exists
-                    log "INFO" "Verifying upload of $blob_name..."
+                    # Add delay before verification (Azure can have slight delay)
+                    log "INFO" "⏳ Waiting 5s for Azure consistency..."
+                    sleep 5
+                    
+                    # Verify upload exists with detailed error reporting
+                    log "INFO" "🔍 Verifying upload of $blob_name..."
+                    local verify_error_file=$(mktemp)
+                    
                     if az storage blob exists \
                       --account-name "$AZURE_STORAGE_ACCOUNT" \
                       --account-key "$AZURE_STORAGE_KEY" \
                       --container-name "$CONTAINER_NAME" \
                       --name "$blob_name" \
-                      --output none 2>/dev/null; then
+                      --output tsv 2>"$verify_error_file" | grep -q "true"; then
                       
-                      log "INFO" "Successfully uploaded and verified $blob_name"
-                      rm -f "$tar_path"
+                      log "INFO" "✅ Successfully uploaded and verified $blob_name"
+                      
+                      # Try to add metadata after successful upload (non-critical)
+                      log "INFO" "📝 Adding metadata to blob..."
+                      az storage blob metadata update \
+                        --account-name "$AZURE_STORAGE_ACCOUNT" \
+                        --account-key "$AZURE_STORAGE_KEY" \
+                        --container-name "$CONTAINER_NAME" \
+                        --name "$blob_name" \
+                        --metadata "backup_date=$backup_date" "ttl_days=$RETENTION_DAYS" "repo_size=$repo_size" "archive_size=$archive_size" \
+                        2>/dev/null || log "WARN" "Failed to add metadata (non-critical)"
+                      
+                      rm -f "$tar_path" "$verify_error_file"
                       echo "$repo_size,$archive_size,$upload_duration"
                       return 0
                     else
-                      log "ERROR" "Upload verification failed for $blob_name - blob does not exist"
-                      rm -f "$tar_path"
+                      local verify_error=$(cat "$verify_error_file" 2>/dev/null || echo "Unknown verification error")
+                      log "ERROR" "❌ Upload verification failed for $blob_name"
+                      log "ERROR" "Verification error: $verify_error"
+                      
+                      # Try to list blobs to see what's actually there
+                      log "INFO" "🔍 Listing recent blobs for debugging..."
+                      az storage blob list \
+                        --account-name "$AZURE_STORAGE_ACCOUNT" \
+                        --account-key "$AZURE_STORAGE_KEY" \
+                        --container-name "$CONTAINER_NAME" \
+                        --prefix "$(echo "$blob_name" | cut -d'_' -f1)" \
+                        --query "[].{name:name,size:properties.contentLength,modified:properties.lastModified}" \
+                        --output table 2>/dev/null | head -10 || log "ERROR" "Could not list blobs"
+                      
+                      rm -f "$tar_path" "$verify_error_file"
                       return 1
                     fi
                   }
