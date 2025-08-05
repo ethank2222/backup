@@ -1,0 +1,231 @@
+name: Repository Backup to Azure Blob Storage
+
+on:
+    workflow_dispatch: # Manual trigger
+    schedule:
+        - cron: "0 2 * * *" # Daily at 2:00 AM UTC
+
+env:
+    AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+    AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+    WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+    BACKUP_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+
+jobs:
+    backup-repositories:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Install Azure CLI
+              run: |
+                  curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+            - name: Install jq for JSON parsing
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y jq curl
+
+            - name: Backup repositories
+              run: |
+                  # Set variables
+                  CONTAINER_NAME="repo-backups"
+                  DATE_STR=$(date +%Y%m%d)
+                  SUCCESSFUL_BACKUPS=()
+                  FAILED_BACKUPS=()
+
+                  # Function to send webhook
+                  send_webhook() {
+                      local success="$1"
+                      local message="$2"
+                      local details="$3"
+                      
+                      if [ -z "$WEBHOOK_URL" ]; then
+                          echo "No webhook URL configured, skipping webhook"
+                          return
+                      fi
+                      
+                      local payload=$(cat <<EOF
+                  {
+                      "success": $success,
+                      "message": "$message",
+                      "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+                      "workflow": "repository-backup",
+                      "details": $details
+                  }
+                  EOF
+                  )
+                      
+                      echo "Sending webhook..."
+                      curl -s -X POST "$WEBHOOK_URL" \
+                          -H "Content-Type: application/json" \
+                          -d "$payload" \
+                          --max-time 30 || echo "Failed to send webhook"
+                  }
+
+                  # Function to clone repository
+                  clone_repository() {
+                      local repo_url="$1"
+                      local temp_dir="$2"
+                      local repo_name=$(basename "$repo_url" .git)
+                      local repo_path="$temp_dir/$repo_name"
+                      
+                      echo "Cloning $repo_url to $repo_path"
+                      
+                      # Use token for GitHub repositories if available
+                      local clone_url="$repo_url"
+                      if [ -n "$BACKUP_TOKEN" ] && [[ "$repo_url" == *"github.com"* ]]; then
+                          clone_url=$(echo "$repo_url" | sed "s|https://|https://$BACKUP_TOKEN@|")
+                      fi
+                      
+                      if git clone --mirror --depth 1 "$clone_url" "$repo_path" 2>/dev/null; then
+                          echo "$repo_path"
+                      else
+                          echo ""
+                      fi
+                  }
+
+                  # Function to upload to Azure Blob Storage
+                  upload_to_blob_storage() {
+                      local local_path="$1"
+                      local blob_name="$2"
+                      
+                      echo "Uploading $blob_name to Azure Blob Storage..."
+                      
+                      # Create tar.gz file
+                      local tar_path="${local_path}.tar.gz"
+                      tar -czf "$tar_path" -C "$(dirname "$local_path")" "$(basename "$local_path")" || return 1
+                      
+                      # Upload using Azure CLI
+                      if az storage blob upload \
+                          --account-name "$AZURE_STORAGE_ACCOUNT" \
+                          --account-key "$AZURE_STORAGE_KEY" \
+                          --container-name "$CONTAINER_NAME" \
+                          --name "$blob_name" \
+                          --file "$tar_path" \
+                          --overwrite \
+                          --content-type "application/gzip" \
+                          --metadata "backup_date=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "ttl_days=10" 2>/dev/null; then
+                          echo "Successfully uploaded $blob_name"
+                          rm -f "$tar_path"
+                          return 0
+                      else
+                          echo "Failed to upload $blob_name"
+                          rm -f "$tar_path"
+                          return 1
+                      fi
+                  }
+
+                  # Function to cleanup old backups
+                  cleanup_old_backups() {
+                      echo "Cleaning up old backups..."
+                      
+                      # Get list of blobs and check their metadata
+                      local cutoff_date=$(date -u -d "10 days ago" +%Y-%m-%dT%H:%M:%S.000Z)
+                      
+                      az storage blob list \
+                          --account-name "$AZURE_STORAGE_ACCOUNT" \
+                          --account-key "$AZURE_STORAGE_KEY" \
+                          --container-name "$CONTAINER_NAME" \
+                          --query "[?metadata.backup_date < '$cutoff_date'].name" \
+                          --output tsv 2>/dev/null | while read -r blob_name; do
+                          if [ -n "$blob_name" ]; then
+                              echo "Deleting old backup: $blob_name"
+                              az storage blob delete \
+                                  --account-name "$AZURE_STORAGE_ACCOUNT" \
+                                  --account-key "$AZURE_STORAGE_KEY" \
+                                  --container-name "$CONTAINER_NAME" \
+                                  --name "$blob_name" 2>/dev/null
+                          fi
+                      done
+                  }
+
+                  # Main backup process
+                  echo "Starting repository backup process..."
+
+                  # Create container if it doesn't exist
+                  az storage container create \
+                      --account-name "$AZURE_STORAGE_ACCOUNT" \
+                      --account-key "$AZURE_STORAGE_KEY" \
+                      --name "$CONTAINER_NAME" 2>/dev/null || true
+
+                  # Read repository list
+                  if [ ! -f "repos.txt" ]; then
+                      echo "Error: repos.txt file not found"
+                      send_webhook false "Backup failed: repos.txt file not found" '{"error": "repos.txt file not found"}'
+                      exit 1
+                  fi
+
+                  # Filter out comments and empty lines
+                  repos=$(grep -v '^#' repos.txt | grep -v '^$' || true)
+
+                  if [ -z "$repos" ]; then
+                      echo "Error: No repositories found in repos.txt"
+                      send_webhook false "Backup failed: No repositories found in repos.txt" '{"error": "No repositories found"}'
+                      exit 1
+                  fi
+
+                  echo "Found $(echo "$repos" | wc -l) repositories to backup"
+
+                  # Create temporary directory
+                  temp_dir=$(mktemp -d)
+                  trap 'rm -rf "$temp_dir"' EXIT
+
+                  # Process each repository
+                  while IFS= read -r repo_url; do
+                      if [ -n "$repo_url" ]; then
+                          echo "Processing: $repo_url"
+                          
+                          # Clone repository
+                          repo_path=$(clone_repository "$repo_url" "$temp_dir")
+                          
+                          if [ -n "$repo_path" ]; then
+                              repo_name=$(basename "$repo_path")
+                              blob_name="${repo_name}_${DATE_STR}.tar.gz"
+                              
+                              # Upload to Azure
+                              if upload_to_blob_storage "$repo_path" "$blob_name"; then
+                                  SUCCESSFUL_BACKUPS+=("{\"repo\":\"$repo_url\",\"blob_name\":\"$blob_name\"}")
+                                  echo "Successfully backed up $repo_url"
+                              else
+                                  FAILED_BACKUPS+=("{\"repo\":\"$repo_url\",\"error\":\"Upload failed\"}")
+                                  echo "Failed to upload $repo_url"
+                              fi
+                          else
+                              FAILED_BACKUPS+=("{\"repo\":\"$repo_url\",\"error\":\"Clone failed\"}")
+                              echo "Failed to clone $repo_url"
+                          fi
+                      fi
+                  done <<< "$repos"
+
+                  # Cleanup old backups
+                  cleanup_old_backups
+
+                  # Prepare webhook details
+                  local successful_count=${#SUCCESSFUL_BACKUPS[@]}
+                  local failed_count=${#FAILED_BACKUPS[@]}
+
+                  if [ $failed_count -gt 0 ]; then
+                      # Convert arrays to JSON arrays
+                      local successful_json=$(IFS=,; echo "[${SUCCESSFUL_BACKUPS[*]}]")
+                      local failed_json=$(IFS=,; echo "[${FAILED_BACKUPS[*]}]")
+                      
+                      local details="{\"successful\":$successful_count,\"failed\":$failed_count,\"failed_repos\":$failed_json}"
+                      send_webhook false "Backup completed with $failed_count failures" "$details"
+                  else
+                      local successful_json=$(IFS=,; echo "[${SUCCESSFUL_BACKUPS[*]}]")
+                      local details="{\"successful\":$successful_count,\"backed_up_repos\":$successful_json}"
+                      send_webhook true "All $successful_count repositories backed up successfully" "$details"
+                  fi
+
+                  echo "Backup process completed"
+                  echo "Successful: $successful_count"
+                  echo "Failed: $failed_count"
+
+            - name: Handle failure
+              if: failure()
+              run: |
+                  echo "Backup workflow failed"
+                  exit 1
