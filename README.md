@@ -7,10 +7,11 @@ This GitHub Actions workflow automatically backs up repositories to Azure Blob S
 -   **Manual Trigger**: Can be started manually via GitHub Actions UI
 -   **Scheduled Backup**: Runs automatically at 2:00 AM UTC daily
 -   **Mirror Cloning**: Creates bare git mirrors for efficient backups
--   **Azure Blob Storage**: Uploads compressed backups to Azure
+-   **Azure Blob Storage**: Uploads compressed ZIP backups to Azure
 -   **Automatic Cleanup**: Removes backups older than 10 days
--   **Webhook Notifications**: Sends notifications on success or failure
+-   **Webhook Notifications**: Sends Teams/Power Automate compatible notifications
 -   **Error Handling**: Comprehensive error handling and reporting
+-   **Success Tracking**: Tracks and reports successful repositories in notifications
 
 ## Setup Instructions
 
@@ -34,10 +35,9 @@ In your GitHub repository, go to **Settings** → **Secrets and variables** → 
 Edit the `repos.txt` file and add the repositories you want to backup:
 
 ```txt
-# Repository URLs to backup
 https://github.com/username/repo1.git
 https://github.com/username/repo2.git
-git@github.com:username/repo3.git
+https://github.com/username/repo3.git
 ```
 
 ### 4. Private Repository Access (Optional)
@@ -46,46 +46,57 @@ If you're backing up private repositories, you'll need to set the `BACKUP_TOKEN`
 
 ### 5. Webhook Configuration (Optional)
 
-If you want webhook notifications, set the `WEBHOOK_URL` secret to your webhook endpoint. The webhook will receive JSON payloads like:
+If you want webhook notifications, set the `WEBHOOK_URL` secret to your webhook endpoint. The webhook will receive Teams/Power Automate compatible JSON payloads with:
 
-**Success:**
+-   **Success/Failure Status**: Clear indication of backup success or failure
+-   **Successful Repositories**: List of all successfully backed up repositories
+-   **Workflow Link**: Direct link to view the GitHub Actions workflow run
+-   **Detailed Statistics**: Total repositories, success count, and failure count
 
-```json
-{
-    "success": true,
-    "message": "All 3 repositories backed up successfully",
-    "timestamp": "2024-01-15T10:30:00.000Z",
-    "workflow": "repository-backup",
-    "details": {
-        "successful": 3,
-        "backed_up_repos": [
-            {
-                "repo": "https://github.com/username/repo1.git",
-                "blob_name": "repo1_20240115.zip"
-            }
-        ]
-    }
-}
-```
-
-**Failure:**
+**Example Success Payload:**
 
 ```json
 {
-    "success": false,
-    "message": "Backup completed with 1 failures",
-    "timestamp": "2024-01-15T10:30:00.000Z",
-    "workflow": "repository-backup",
-    "details": {
-        "successful": 2,
-        "failed": 1,
-        "failed_repos": [
-            {
-                "repo": "https://github.com/username/repo3.git",
-                "error": "Clone failed"
-            }
-        ]
-    }
+    "@type": "MessageCard",
+    "@context": "http://schema.org/extensions",
+    "themeColor": "00FF00",
+    "summary": "Repository Backup ✅ Success",
+    "sections": [
+        {
+            "activityTitle": "GitHub Repository Backup",
+            "activitySubtitle": "2024-01-15 10:30:00 UTC",
+            "facts": [
+                {
+                    "name": "Status",
+                    "value": "✅ Success"
+                },
+                {
+                    "name": "Result",
+                    "value": "Backup successful: All 3 repositories backed up"
+                },
+                {
+                    "name": "Successful Repositories",
+                    "value": "TrinityAI, TriniTeam, PageAI"
+                },
+                {
+                    "name": "Workflow",
+                    "value": "repository-backup"
+                }
+            ]
+        }
+    ],
+    "potentialAction": [
+        {
+            "@type": "OpenUri",
+            "name": "View Workflow Run",
+            "targets": [
+                {
+                    "os": "default",
+                    "uri": "https://github.com/username/repo/actions/runs/123456789"
+                }
+            ]
+        }
+    ]
 }
 ```
 
@@ -99,16 +110,16 @@ If you want webhook notifications, set the `WEBHOOK_URL` secret to your webhook 
 ### Process
 
 1. **Clone**: Creates bare git mirrors of each repository
-2. **Compress**: Creates tar.gz archives of the repositories
+2. **Compress**: Creates ZIP archives of the repositories
 3. **Upload**: Uploads to Azure Blob Storage with metadata
 4. **Cleanup**: Removes backups older than 10 days
-5. **Notify**: Sends webhook notifications
+5. **Notify**: Sends webhook notifications with success details
 
 ### Storage Structure
 
 -   **Container**: `repo-backups`
--   **Blob Names**: `{repo-name}_{YYYYMMDD}.zip` (e.g., `TrinityAI_20240115.zip`)
--   **Metadata**: Includes backup date and TTL information
+-   **Blob Names**: `{repo-name}_{YYYYMMDD_HHMMSS}.zip` (e.g., `TrinityAI_20240115_143022.zip`)
+-   **Format**: ZIP archives containing git mirror repositories
 
 ## Security Considerations
 
@@ -136,37 +147,26 @@ Check the GitHub Actions logs for detailed information about:
 -   Cleanup operations
 -   Webhook delivery status
 
-## Testing Locally
+## Project Structure
 
-You can test your configuration locally using the provided test script:
-
-```bash
-# Make the test script executable
-chmod +x test_setup.sh
-
-# Set your environment variables
-export AZURE_STORAGE_ACCOUNT="your-storage-account"
-export AZURE_STORAGE_KEY="your-storage-key"
-export BACKUP_TOKEN="your-github-token"  # Optional
-
-# Run the test
-./test_setup.sh
 ```
-
-The test script will verify:
-
--   Azure Storage connection and permissions
--   GitHub token validity (if provided)
--   Repository list file format
+backup/
+├── .github/
+│   └── workflows/
+│       └── backup-repos.yml    # Main workflow file
+├── repos.txt                   # List of repositories to backup
+└── README.md                   # This file
+```
 
 ## Customization
 
 You can modify the workflow to:
 
--   Change the schedule (edit the cron expression)
--   Adjust retention period (modify the cleanup logic)
+-   Change the schedule (edit the cron expression in the workflow)
+-   Adjust retention period (modify the `RETENTION_DAYS` environment variable)
 -   Add additional notification methods
 -   Customize the backup format or compression
+-   Modify webhook payload format
 
 ## License
 
