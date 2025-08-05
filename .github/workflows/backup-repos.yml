@@ -65,39 +65,50 @@ jobs:
                           --max-time 30 || echo "Failed to send webhook"
                   }
 
-                  # Function to clone repository
-                  clone_repository() {
-                      local repo_url="$1"
-                      local temp_dir="$2"
-                      local repo_name=$(basename "$repo_url" .git)
-                      local repo_path="$temp_dir/$repo_name"
-                      
-                      echo "Cloning $repo_url to $repo_path"
-                      
-                                             # Use token for GitHub repositories if available
+                                     # Function to clone repository
+                   clone_repository() {
+                       local repo_url="$1"
+                       local temp_dir="$2"
+                       local repo_name=$(basename "$repo_url" .git)
+                       local repo_path="$temp_dir/$repo_name"
+                       
+                       echo "Cloning $repo_url to $repo_path"
+                       
+                       # Use token for GitHub repositories if available
                        local clone_url="$repo_url"
                        if [ -n "$BACKUP_TOKEN" ] && [[ "$repo_url" == *"github.com"* ]]; then
                            # Create authenticated URL without exposing token in logs
                            clone_url="https://${BACKUP_TOKEN}@$(echo "$repo_url" | sed 's|https://||')"
                        fi
-                      
-                      if git clone --mirror --depth 1 "$clone_url" "$repo_path" 2>/dev/null; then
-                          echo "$repo_path"
-                      else
-                          echo ""
-                      fi
-                  }
+                       
+                       if git clone --mirror --depth 1 "$clone_url" "$repo_path" 2>/dev/null; then
+                           # Verify the repository was actually cloned
+                           if [ -d "$repo_path" ] && [ -d "$repo_path/.git" ]; then
+                               echo "$repo_path"
+                           else
+                               echo ""
+                           fi
+                       else
+                           echo ""
+                       fi
+                   }
 
-                  # Function to upload to Azure Blob Storage
-                  upload_to_blob_storage() {
-                      local local_path="$1"
-                      local blob_name="$2"
-                      
-                      echo "Uploading $blob_name to Azure Blob Storage..."
-                      
-                      # Create tar.gz file
-                      local tar_path="${local_path}.tar.gz"
-                      tar -czf "$tar_path" -C "$(dirname "$local_path")" "$(basename "$local_path")" || return 1
+                                     # Function to upload to Azure Blob Storage
+                   upload_to_blob_storage() {
+                       local local_path="$1"
+                       local blob_name="$2"
+                       
+                       echo "Uploading $blob_name to Azure Blob Storage..."
+                       
+                       # Verify the repository path exists
+                       if [ ! -d "$local_path" ]; then
+                           echo "Repository path does not exist: $local_path"
+                           return 1
+                       fi
+                       
+                       # Create tar.gz file
+                       local tar_path="${local_path}.tar.gz"
+                       tar -czf "$tar_path" -C "$(dirname "$local_path")" "$(basename "$local_path")" || return 1
                       
                       # Upload using Azure CLI
                       if az storage blob upload \
