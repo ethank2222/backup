@@ -132,6 +132,7 @@ jobs:
 
                   if ! az storage account show \
                     --name "$AZURE_STORAGE_ACCOUNT" \
+                    --account-key "$AZURE_STORAGE_KEY" \
                     --query "name" \
                     --output tsv; then
                     log "ERROR" "Failed to authenticate with Azure storage account: $AZURE_STORAGE_ACCOUNT"
@@ -359,6 +360,7 @@ jobs:
                     log "INFO" "Testing Azure connection..."
                     if ! az storage account show \
                       --name "$AZURE_STORAGE_ACCOUNT" \
+                      --account-key "$AZURE_STORAGE_KEY" \
                       --query "name" \
                       --output tsv >/dev/null 2>&1; then
                       log "ERROR" "Cannot access Azure storage account: $AZURE_STORAGE_ACCOUNT"
