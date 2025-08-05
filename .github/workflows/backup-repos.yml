@@ -94,25 +94,77 @@ jobs:
 
             - name: Install dependencies
               run: |
-                  # Install Azure CLI
-                  curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+                  set -euo pipefail
 
-                  # Install additional tools
-                  sudo apt-get update
-                  sudo apt-get install -y jq curl parallel
+                  echo "📦 Installing Azure CLI..."
+                  if ! curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash; then
+                    echo "❌ Failed to install Azure CLI"
+                    exit 1
+                  fi
+
+                  echo "📦 Installing additional tools..."
+                  if ! sudo apt-get update; then
+                    echo "❌ Failed to update package list"
+                    exit 1
+                  fi
+
+                  if ! sudo apt-get install -y jq curl parallel bc; then
+                    echo "❌ Failed to install required packages"
+                    exit 1
+                  fi
+
+                  # Verify installations
+                  echo "✅ Verifying installations..."
+                  az --version | head -1
+                  jq --version
+                  bc --version | head -1
+
+                  echo "✅ All dependencies installed successfully"
 
             - name: Setup Azure CLI
               run: |
-                  # Test Azure connection
-                  az storage container exists \
-                    --account-name "$AZURE_STORAGE_ACCOUNT" \
-                    --account-key "$AZURE_STORAGE_KEY" \
-                    --name "$CONTAINER_NAME" || \
-                  az storage container create \
+                  # Test Azure connection and credentials
+                  log() {
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${*:2}"
+                  }
+
+                  log "INFO" "Testing Azure CLI authentication..."
+
+                  if ! az storage account show \
+                    --name "$AZURE_STORAGE_ACCOUNT" \
+                    --query "name" \
+                    --output tsv; then
+                    log "ERROR" "Failed to authenticate with Azure storage account: $AZURE_STORAGE_ACCOUNT"
+                    log "ERROR" "Please verify AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_KEY secrets"
+                    exit 1
+                  fi
+
+                  log "INFO" "Azure authentication successful"
+
+                  # Create container if it doesn't exist
+                  log "INFO" "Ensuring backup container exists: $CONTAINER_NAME"
+
+                  if az storage container exists \
                     --account-name "$AZURE_STORAGE_ACCOUNT" \
                     --account-key "$AZURE_STORAGE_KEY" \
                     --name "$CONTAINER_NAME" \
-                    --public-access off
+                    --query "exists" \
+                    --output tsv | grep -q "true"; then
+                    log "INFO" "Container '$CONTAINER_NAME' already exists"
+                  else
+                    log "INFO" "Creating container '$CONTAINER_NAME'"
+                    if az storage container create \
+                      --account-name "$AZURE_STORAGE_ACCOUNT" \
+                      --account-key "$AZURE_STORAGE_KEY" \
+                      --name "$CONTAINER_NAME" \
+                      --public-access off \
+                      --output none; then
+                      log "INFO" "Container created successfully"
+                    else
+                      log "ERROR" "Failed to create container '$CONTAINER_NAME'"
+                      exit 1
+                    fi
+                  fi
 
             - name: Backup repositories
               run: |
@@ -140,21 +192,21 @@ jobs:
                     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $*"
                   }
 
-                  # Retry function with exponential backoff
-                  retry_with_backoff() {
+                  # Retry function with exponential backoff (simplified)
+                  retry_command() {
                     local max_attempts="$1"
                     local delay="$2"
-                    local command="${*:3}"
+                    shift 2
                     local attempt=1
                     
                     while [ $attempt -le $max_attempts ]; do
-                      log "INFO" "Attempt $attempt of $max_attempts: $command"
+                      log "INFO" "Executing command (attempt $attempt of $max_attempts)"
                       
-                      if eval "$command"; then
+                      if "$@"; then
                         return 0
                       else
                         if [ $attempt -eq $max_attempts ]; then
-                          log "ERROR" "Command failed after $max_attempts attempts: $command"
+                          log "ERROR" "Command failed after $max_attempts attempts"
                           return 1
                         fi
                         
@@ -266,56 +318,126 @@ jobs:
                     fi
                     
                     # Calculate repository size
-                    local repo_size=$(du -sb "$repo_path" | cut -f1)
-                    log "INFO" "Repository size: $(numfmt --to=iec $repo_size)"
+                    local repo_size=$(du -sb "$repo_path" 2>/dev/null | cut -f1)
+                    if [ -z "$repo_size" ] || [ "$repo_size" -eq 0 ]; then
+                      log "ERROR" "Could not determine repository size for $repo_name"
+                      return 1
+                    fi
                     
-                    # Create compressed archive with progress
+                    log "INFO" "Repository size: $(numfmt --to=iec $repo_size 2>/dev/null || echo "${repo_size} bytes")"
+                    
+                    # Create compressed archive
                     local tar_path="${repo_path}.tar.gz"
-                    if ! tar -czf "$tar_path" -C "$(dirname "$repo_path")" "$(basename "$repo_path")"; then
+                    log "INFO" "Creating archive: $tar_path"
+                    
+                    if ! tar -czf "$tar_path" -C "$(dirname "$repo_path")" "$(basename "$repo_path")" 2>/dev/null; then
                       log "ERROR" "Failed to create archive for $repo_name"
                       return 1
                     fi
                     
-                    local archive_size=$(stat -c%s "$tar_path")
-                    local compression_ratio=$(echo "scale=1; $archive_size * 100 / $repo_size" | bc -l)
-                    log "INFO" "Archive size: $(numfmt --to=iec $archive_size) (${compression_ratio}% of original)"
+                    if [ ! -f "$tar_path" ]; then
+                      log "ERROR" "Archive file was not created: $tar_path"
+                      return 1
+                    fi
                     
-                    # Upload with metadata and retry
+                    local archive_size=$(stat -c%s "$tar_path" 2>/dev/null)
+                    if [ -z "$archive_size" ] || [ "$archive_size" -eq 0 ]; then
+                      log "ERROR" "Archive appears to be empty or unreadable"
+                      rm -f "$tar_path"
+                      return 1
+                    fi
+                    
+                    # Calculate compression ratio safely
+                    local compression_ratio="N/A"
+                    if command -v bc >/dev/null 2>&1 && [ "$repo_size" -gt 0 ]; then
+                      compression_ratio=$(echo "scale=1; $archive_size * 100 / $repo_size" | bc -l 2>/dev/null || echo "N/A")
+                    fi
+                    
+                    log "INFO" "Archive size: $(numfmt --to=iec $archive_size 2>/dev/null || echo "${archive_size} bytes") (${compression_ratio}% of original)"
+                    
+                    # Test Azure CLI connectivity first
+                    log "INFO" "Testing Azure connection..."
+                    if ! az storage account show \
+                      --name "$AZURE_STORAGE_ACCOUNT" \
+                      --query "name" \
+                      --output tsv >/dev/null 2>&1; then
+                      log "ERROR" "Cannot access Azure storage account: $AZURE_STORAGE_ACCOUNT"
+                      rm -f "$tar_path"
+                      return 1
+                    fi
+                    
+                    # Upload with retries
                     local upload_start=$(date +%s)
-                    if retry_with_backoff 3 5 "az storage blob upload \
-                      --account-name '$AZURE_STORAGE_ACCOUNT' \
-                      --account-key '$AZURE_STORAGE_KEY' \
-                      --container-name '$CONTAINER_NAME' \
-                      --name '$blob_name' \
-                      --file '$tar_path' \
-                      --overwrite \
-                      --content-type 'application/gzip' \
-                      --metadata backup_date='$(date -u +%Y-%m-%dT%H:%M:%S.000Z)' ttl_days='$RETENTION_DAYS' repo_size='$repo_size' archive_size='$archive_size' \
-                      --no-progress \
-                      --output none"; then
+                    local upload_success=false
+                    local attempt=1
+                    local max_attempts=3
+                    
+                    while [ $attempt -le $max_attempts ] && [ "$upload_success" = "false" ]; do
+                      log "INFO" "Upload attempt $attempt of $max_attempts for $blob_name"
                       
-                      local upload_duration=$(($(date +%s) - upload_start))
-                      local upload_speed=$(echo "scale=2; $archive_size / 1024 / 1024 / $upload_duration" | bc -l)
-                      log "INFO" "Successfully uploaded $blob_name (${upload_speed} MB/s)"
+                      # Create metadata as separate variables to avoid quoting issues
+                      local backup_date_meta="backup_date=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+                      local ttl_meta="ttl_days=$RETENTION_DAYS"
+                      local size_meta="repo_size=$repo_size"
+                      local archive_meta="archive_size=$archive_size"
                       
-                      # Verify upload
-                      if az storage blob exists \
+                      # Execute upload command directly (avoiding complex retry function)
+                      if az storage blob upload \
                         --account-name "$AZURE_STORAGE_ACCOUNT" \
                         --account-key "$AZURE_STORAGE_KEY" \
                         --container-name "$CONTAINER_NAME" \
                         --name "$blob_name" \
-                        --output none; then
+                        --file "$tar_path" \
+                        --overwrite \
+                        --content-type "application/gzip" \
+                        --metadata "$backup_date_meta" "$ttl_meta" "$size_meta" "$archive_meta" \
+                        --no-progress \
+                        --output none 2>/dev/null; then
                         
-                        rm -f "$tar_path"
-                        echo "$repo_size,$archive_size,$upload_duration"
-                        return 0
+                        log "INFO" "Upload command completed for $blob_name"
+                        upload_success=true
                       else
-                        log "ERROR" "Upload verification failed for $blob_name"
-                        rm -f "$tar_path"
-                        return 1
+                        log "WARN" "Upload attempt $attempt failed for $blob_name"
+                        if [ $attempt -lt $max_attempts ]; then
+                          local wait_time=$((5 * attempt))
+                          log "INFO" "Waiting ${wait_time}s before retry..."
+                          sleep $wait_time
+                        fi
+                        attempt=$((attempt + 1))
                       fi
+                    done
+                    
+                    if [ "$upload_success" = "false" ]; then
+                      log "ERROR" "Failed to upload $blob_name after $max_attempts attempts"
+                      rm -f "$tar_path"
+                      return 1
+                    fi
+                    
+                    local upload_duration=$(($(date +%s) - upload_start))
+                    
+                    # Calculate upload speed safely
+                    local upload_speed="N/A"
+                    if command -v bc >/dev/null 2>&1 && [ "$upload_duration" -gt 0 ]; then
+                      upload_speed=$(echo "scale=2; $archive_size / 1024 / 1024 / $upload_duration" | bc -l 2>/dev/null || echo "N/A")
+                    fi
+                    
+                    log "INFO" "Upload completed for $blob_name (${upload_speed} MB/s)"
+                    
+                    # Verify upload exists
+                    log "INFO" "Verifying upload of $blob_name..."
+                    if az storage blob exists \
+                      --account-name "$AZURE_STORAGE_ACCOUNT" \
+                      --account-key "$AZURE_STORAGE_KEY" \
+                      --container-name "$CONTAINER_NAME" \
+                      --name "$blob_name" \
+                      --output none 2>/dev/null; then
+                      
+                      log "INFO" "Successfully uploaded and verified $blob_name"
+                      rm -f "$tar_path"
+                      echo "$repo_size,$archive_size,$upload_duration"
+                      return 0
                     else
-                      log "ERROR" "Failed to upload $blob_name after retries"
+                      log "ERROR" "Upload verification failed for $blob_name - blob does not exist"
                       rm -f "$tar_path"
                       return 1
                     fi
@@ -391,35 +513,53 @@ jobs:
                       if repo_path=$(clone_repository "$repo_url" "$repo_temp_dir"); then
                         blob_name="${repo_name}_${DATE_STR}.tar.gz"
                         
+                        log "INFO" "Repository cloned successfully: $repo_path"
+                        log "INFO" "Starting upload process for blob: $blob_name"
+                        
                         # Upload to Azure
                         if backup_stats=$(upload_to_blob_storage "$repo_path" "$blob_name"); then
-                          IFS=',' read -r repo_size archive_size upload_time <<< "$backup_stats"
+                          log "INFO" "Upload function returned: $backup_stats"
                           
-                          repo_duration=$(($(date +%s) - repo_start))
-                          
-                          SUCCESSFUL_BACKUPS+=($(jq -n \
-                            --arg repo "$repo_url" \
-                            --arg blob_name "$blob_name" \
-                            --argjson repo_size "$repo_size" \
-                            --argjson archive_size "$archive_size" \
-                            --argjson duration "$repo_duration" \
-                            '{repo: $repo, blob_name: $blob_name, repo_size: $repo_size, archive_size: $archive_size, duration: $duration}'))
-                          
-                          total_size=$((total_size + repo_size))
-                          total_compressed=$((total_compressed + archive_size))
-                          
-                          log "INFO" "✅ Successfully backed up $repo_name in ${repo_duration}s"
+                          # Parse the returned stats
+                          if [[ "$backup_stats" =~ ^[0-9]+,[0-9]+,[0-9]+$ ]]; then
+                            IFS=',' read -r repo_size archive_size upload_time <<< "$backup_stats"
+                            
+                            repo_duration=$(($(date +%s) - repo_start))
+                            
+                            SUCCESSFUL_BACKUPS+=($(jq -n \
+                              --arg repo "$repo_url" \
+                              --arg blob_name "$blob_name" \
+                              --argjson repo_size "$repo_size" \
+                              --argjson archive_size "$archive_size" \
+                              --argjson duration "$repo_duration" \
+                              '{repo: $repo, blob_name: $blob_name, repo_size: $repo_size, archive_size: $archive_size, duration: $duration}'))
+                            
+                            total_size=$((total_size + repo_size))
+                            total_compressed=$((total_compressed + archive_size))
+                            
+                            log "INFO" "✅ Successfully backed up $repo_name in ${repo_duration}s"
+                          else
+                            log "ERROR" "Invalid backup stats format returned: '$backup_stats'"
+                            FAILED_BACKUPS+=($(jq -n \
+                              --arg repo "$repo_url" \
+                              --arg error "Invalid backup stats returned" \
+                              '{repo: $repo, error: $error}'))
+                          fi
                         else
+                          upload_exit_code=$?
+                          log "ERROR" "Upload function failed with exit code: $upload_exit_code"
                           FAILED_BACKUPS+=($(jq -n \
                             --arg repo "$repo_url" \
-                            --arg error "Upload failed" \
+                            --arg error "Upload failed (exit code: $upload_exit_code)" \
                             '{repo: $repo, error: $error}'))
                           log "ERROR" "❌ Failed to upload $repo_name"
                         fi
                       else
+                        clone_exit_code=$?
+                        log "ERROR" "Clone function failed with exit code: $clone_exit_code"
                         FAILED_BACKUPS+=($(jq -n \
                           --arg repo "$repo_url" \
-                          --arg error "Clone failed" \
+                          --arg error "Clone failed (exit code: $clone_exit_code)" \
                           '{repo: $repo, error: $error}'))
                         log "ERROR" "❌ Failed to clone $repo_name"
                       fi
