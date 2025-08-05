@@ -72,14 +72,14 @@ jobs:
                        local repo_name=$(basename "$repo_url" .git)
                        local repo_path="$temp_dir/$repo_name"
                        
-                       echo "Cloning $repo_url to $repo_path"
-                       
                        # Use token for GitHub repositories if available
                        local clone_url="$repo_url"
                        if [ -n "$BACKUP_TOKEN" ] && [[ "$repo_url" == *"github.com"* ]]; then
                            # Create authenticated URL without exposing token in logs
                            clone_url="https://${BACKUP_TOKEN}@$(echo "$repo_url" | sed 's|https://||')"
                        fi
+                       
+                       echo "Cloning $repo_url to $repo_path" >&2
                        
                        if git clone --mirror --depth 1 "$clone_url" "$repo_path" 2>/dev/null; then
                            # Verify the repository was actually cloned
@@ -215,22 +215,22 @@ jobs:
                   # Cleanup old backups
                   cleanup_old_backups
 
-                  # Prepare webhook details
-                  local successful_count=${#SUCCESSFUL_BACKUPS[@]}
-                  local failed_count=${#FAILED_BACKUPS[@]}
+                                     # Prepare webhook details
+                   successful_count=${#SUCCESSFUL_BACKUPS[@]}
+                   failed_count=${#FAILED_BACKUPS[@]}
 
-                  if [ $failed_count -gt 0 ]; then
-                      # Convert arrays to JSON arrays
-                      local successful_json=$(IFS=,; echo "[${SUCCESSFUL_BACKUPS[*]}]")
-                      local failed_json=$(IFS=,; echo "[${FAILED_BACKUPS[*]}]")
-                      
-                      local details="{\"successful\":$successful_count,\"failed\":$failed_count,\"failed_repos\":$failed_json}"
-                      send_webhook false "Backup completed with $failed_count failures" "$details"
-                  else
-                      local successful_json=$(IFS=,; echo "[${SUCCESSFUL_BACKUPS[*]}]")
-                      local details="{\"successful\":$successful_count,\"backed_up_repos\":$successful_json}"
-                      send_webhook true "All $successful_count repositories backed up successfully" "$details"
-                  fi
+                                     if [ $failed_count -gt 0 ]; then
+                       # Convert arrays to JSON arrays
+                       successful_json=$(IFS=,; echo "[${SUCCESSFUL_BACKUPS[*]}]")
+                       failed_json=$(IFS=,; echo "[${FAILED_BACKUPS[*]}]")
+                       
+                       details="{\"successful\":$successful_count,\"failed\":$failed_count,\"failed_repos\":$failed_json}"
+                       send_webhook false "Backup completed with $failed_count failures" "$details"
+                   else
+                       successful_json=$(IFS=,; echo "[${SUCCESSFUL_BACKUPS[*]}]")
+                       details="{\"successful\":$successful_count,\"backed_up_repos\":$successful_json}"
+                       send_webhook true "All $successful_count repositories backed up successfully" "$details"
+                   fi
 
                   echo "Backup process completed"
                   echo "Successful: $successful_count"
