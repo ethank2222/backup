@@ -95,7 +95,7 @@ test_github_token() {
         return
     fi
     
-    # Test GitHub API access
+    # Test GitHub API access (token is hidden from logs)
     if curl -s -H "Authorization: token $BACKUP_TOKEN" \
         "https://api.github.com/user" | grep -q '"login"'; then
         USER_LOGIN=$(curl -s -H "Authorization: token $BACKUP_TOKEN" \

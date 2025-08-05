@@ -74,11 +74,12 @@ jobs:
                       
                       echo "Cloning $repo_url to $repo_path"
                       
-                      # Use token for GitHub repositories if available
-                      local clone_url="$repo_url"
-                      if [ -n "$BACKUP_TOKEN" ] && [[ "$repo_url" == *"github.com"* ]]; then
-                          clone_url=$(echo "$repo_url" | sed "s|https://|https://$BACKUP_TOKEN@|")
-                      fi
+                                             # Use token for GitHub repositories if available
+                       local clone_url="$repo_url"
+                       if [ -n "$BACKUP_TOKEN" ] && [[ "$repo_url" == *"github.com"* ]]; then
+                           # Create authenticated URL without exposing token in logs
+                           clone_url="https://${BACKUP_TOKEN}@$(echo "$repo_url" | sed 's|https://||')"
+                       fi
                       
                       if git clone --mirror --depth 1 "$clone_url" "$repo_path" 2>/dev/null; then
                           echo "$repo_path"

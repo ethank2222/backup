@@ -116,6 +116,7 @@ If you want webhook notifications, set the `WEBHOOK_URL` secret to your webhook 
 -   Consider using Azure Key Vault for storing sensitive credentials
 -   Ensure your webhook endpoint is secure and can handle the payload format
 -   Review repository access permissions for private repositories
+-   **Token Protection**: All tokens and credentials are automatically hidden from logs and output
 
 ## Troubleshooting
 
