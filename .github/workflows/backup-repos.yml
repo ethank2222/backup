@@ -42,6 +42,7 @@ jobs:
                   SUCCESS_COUNT=0
                   FAIL_COUNT=0
                   FAILED_REPOS=""
+                  SUCCESSFUL_REPOS=""
                   DATE_PREFIX=$(date +%Y%m%d_%H%M%S)
 
                   # Function to send webhook (Teams/Power Automate compatible)
@@ -52,8 +53,10 @@ jobs:
                     
                     local success="$1"
                     local message="$2"
+                    local successful_repos="$3"
                     local color=$([ "$success" = "true" ] && echo "00FF00" || echo "FF0000")
                     local status=$([ "$success" = "true" ] && echo "✅ Success" || echo "❌ Failed")
+                    local workflow_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID:-}"
                     
                     # Create adaptive card format for Teams/Power Automate
                     local payload=$(cat <<EOF
@@ -76,6 +79,10 @@ jobs:
                           "value": "$message"
                         },
                         {
+                          "name": "Successful Repositories",
+                          "value": "$successful_repos"
+                        },
+                        {
                           "name": "Workflow",
                           "value": "repository-backup"
                         },
@@ -91,7 +98,7 @@ jobs:
                       "name": "View Workflow Run",
                       "targets": [{
                         "os": "default",
-                        "uri": "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID:-}"
+                        "uri": "$workflow_url"
                       }]
                     }],
                     "attachments": [{
@@ -109,6 +116,16 @@ jobs:
                           {
                             "type": "TextBlock",
                             "text": "$message",
+                            "wrap": true
+                          },
+                          {
+                            "type": "TextBlock",
+                            "text": "**Successful Repositories:** $successful_repos",
+                            "wrap": true
+                          },
+                          {
+                            "type": "TextBlock",
+                            "text": "[View Workflow Run]($workflow_url)",
                             "wrap": true
                           }
                         ]
@@ -200,6 +217,7 @@ jobs:
                     
                     if backup_repo "$repo_url"; then
                       SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                      SUCCESSFUL_REPOS="${SUCCESSFUL_REPOS}$(basename "$repo_url" .git), "
                     else
                       FAIL_COUNT=$((FAIL_COUNT + 1))
                       FAILED_REPOS="${FAILED_REPOS}$(basename "$repo_url" .git), "
@@ -237,11 +255,11 @@ jobs:
 
                   # Send webhook notification
                   if [ $FAIL_COUNT -eq 0 ]; then
-                    send_webhook true "Backup successful: All $SUCCESS_COUNT repositories backed up"
+                    send_webhook true "Backup successful: All $SUCCESS_COUNT repositories backed up" "${SUCCESSFUL_REPOS%, }"
                     echo ""
                     echo "✅ Backup completed successfully!"
                   else
-                    send_webhook false "Backup completed with errors: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed (${FAILED_REPOS%, })"
+                    send_webhook false "Backup completed with errors: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed (${FAILED_REPOS%, })" "${SUCCESSFUL_REPOS%, }"
                     echo ""
                     echo "⚠️ Backup completed with $FAIL_COUNT failures"
                     exit 1
