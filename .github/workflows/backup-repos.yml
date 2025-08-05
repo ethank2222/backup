@@ -69,6 +69,7 @@ jobs:
                     local repo_url="$1"
                     local repo_name=$(basename "$repo_url" .git)
                     local temp_dir=$(mktemp -d)
+                    local current_dir=$(pwd)
                     
                     echo "📦 Backing up: $repo_name"
                     
@@ -80,16 +81,23 @@ jobs:
                       local auth_url="$repo_url"
                     fi
                     
-                    if ! git clone --mirror "$auth_url" "$temp_dir/$repo_name" 2>/dev/null; then
+                    # Clone with error output for debugging
+                    local clone_error=$(mktemp)
+                    if ! git clone --mirror "$auth_url" "$temp_dir/$repo_name" 2>"$clone_error"; then
                       echo "❌ Failed to clone: $repo_name"
+                      # Show error for debugging (remove in production if sensitive)
+                      echo "   Error: $(head -1 "$clone_error" | sed 's/.*github.com/github.com/' | cut -d: -f1-2)"
+                      rm -f "$clone_error"
                       rm -rf "$temp_dir"
                       return 1
                     fi
+                    rm -f "$clone_error"
                     
-                    # Create archive
+                    # Create archive (without changing directory)
                     local archive_name="${repo_name}_${DATE_PREFIX}.zip"
-                    cd "$temp_dir"
-                    if ! zip -qr "$archive_name" "$repo_name"; then
+                    local archive_path="$temp_dir/$archive_name"
+                    
+                    if ! (cd "$temp_dir" && zip -qr "$archive_name" "$repo_name"); then
                       echo "❌ Failed to archive: $repo_name"
                       rm -rf "$temp_dir"
                       return 1
@@ -101,7 +109,7 @@ jobs:
                       --account-key "$AZURE_STORAGE_KEY" \
                       --container-name "$CONTAINER_NAME" \
                       --name "$archive_name" \
-                      --file "$archive_name" \
+                      --file "$archive_path" \
                       --overwrite \
                       --output none 2>/dev/null; then
                       echo "❌ Failed to upload: $repo_name"
@@ -110,6 +118,7 @@ jobs:
                     fi
                     
                     echo "✅ Successfully backed up: $repo_name"
+                    cd "$current_dir"  # Ensure we're back in a valid directory
                     rm -rf "$temp_dir"
                     return 0
                   }
