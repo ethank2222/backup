@@ -1,0 +1,27 @@
+name: Repository Backup (Modular)
+
+on:
+    schedule:
+        - cron: "0 2 * * *" # Daily at 2 AM UTC
+    workflow_dispatch:
+
+env:
+    AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+    AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+    GITHUB_TOKEN: ${{ secrets.BACKUP_TOKEN }}
+    WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+    CONTAINER_NAME: "repo-backups"
+
+jobs:
+    backup:
+        runs-on: ubuntu-latest
+        timeout-minutes: 120
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Run Modular Backup
+              run: |
+                  chmod +x scripts/*.sh
+                  scripts/run-workflow.sh
