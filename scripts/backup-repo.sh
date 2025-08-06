@@ -24,7 +24,7 @@ backup_repo() {
   fi
   
   # Create archive
-  local archive_name="${repo_name}_${DATE_PREFIX}.zip"
+  local archive_name="${DATE_PREFIX}_${repo_name}.zip"
   local archive_path="$temp_dir/$archive_name"
   
   (cd "$temp_dir" && zip -qr "$archive_name" "$repo_name")
